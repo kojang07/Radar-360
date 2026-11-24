@@ -1,27 +1,27 @@
 /*
  * ============================================================================
- *  RADAR 360 - Realtime ADS-B Airplane Radar, Live Weather & Luxury Clock
+ *  RADAR 360 - Realtime ADS-B Airplane Radar & Live Weather (Lightweight Ed.)
  * ============================================================================
  *  [하드웨어]
  *   - Board   : ESP32-4848S040 (ESP32-S3, 4.0" 480x480 RGB LCD, ST7701S)
+ *   - Touch   : GT911 Capacitive Touch (I2C SDA=19, SCL=45, Addr=0x5D)
  *   - Memory  : 16MB Flash, 8MB OPI PSRAM (Arduino IDE에서 OPI PSRAM 필수 활성화)
  *
- *  [주요 기능]
- *   1. Flight Radar : 실시간 항공기 추적 (adsb.lol / adsb.fi / airplanes.live)
- *                     Google Maps 배경 지도(위성/로드맵/지형도) + 회전형 비행기 아이콘
- *   2. Weather View : Open-Meteo 실시간 기상 + 3일 예보 + RainViewer 강수 레이더
- *   3. Clock View   : 세계 시간대 설정 + 아날로그 4종(Rolex/Longines/Breitling/Omega)
- *                     + 디지털 3종(Modern/Neon Ring/Retro Flip)
- *   4. Web Console  : Wi-Fi 미연결 시 AP 모드("RADAR-360-Setup", 192.168.4.1) 자동 실행
- *                     Wi-Fi 연결 후 http://radar.local 로 모든 설정 실시간 변경 가능
+ *  [주요 기능 및 안정화]
+ *   1. 화면 흔들림 해결 : RGB PCLK 6MHz 최적화 (PSRAM/Wi-Fi 통신 시 DMA 충돌 방지)
+ *   2. 초경량 지도 적용 : ArcGIS Dark Gray (3~10KB) 기본 적용 + Google Roadmap 선택
+ *   3. Flight Radar     : 실시간 항공기 추적 (adsb.lol / adsb.fi / airplanes.live)
+ *   4. Weather View     : Open-Meteo 실시간 기상 + 3일 예보 + RainViewer 강수 레이더
+ *   5. 수동 OTA 업데이트: 웹 콘솔 System 탭에서 GitHub 원격 / 로컬 .bin 업데이트
+ *      ※ 새 .bin 파일 생성 전 반드시 아래 FW_VERSION을 새 번호로 수정하세요!
  *
- *  [Arduino IDE 권장 설정]
+ *  [Arduino IDE 필수 설정]
  *   - Board            : ESP32S3 Dev Module
  *   - Flash Size       : 16MB (128Mb)
  *   - Flash Mode       : DIO
  *   - PSRAM            : OPI PSRAM
- *   - Partition Scheme : Huge APP (3MB No OTA / 1MB SPIFFS)
- *   - Upload Speed     : 115200 (macOS 안정화 권장)
+ *   - Partition Scheme : 16M Flash (3MB APP/9.9MB FATFS)  <-- OTA 필수
+ *   - Upload Speed     : 115200
  * ============================================================================
  */
 
@@ -37,10 +37,23 @@
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <Update.h>
+#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
 #include <math.h>
 #include "time.h"
+
+// ==========================================
+// 0. OTA 버전 관리 설정
+// ==========================================
+#define FW_VERSION "1.0.2"
+const char* GITHUB_VERSION_URL = "https://raw.githubusercontent.com/kojang07/Radar-360/main/version.json";
+
+String otaLatestVer = FW_VERSION;
+String otaBinUrl    = "";
+bool   otaAvailable = false;
+volatile bool otaTriggerFlag = false;
 
 // ==========================================
 // 1. 설정 구조체 및 전역 객체
@@ -62,12 +75,12 @@ struct RadarConfig {
   int    minAltFt   = 0;
   int    maxAltFt   = 60000;
   int    maxAc      = 24;
-  int    mapStyle   = 0;      // 0: Google Satellite Hybrid, 1: Google Roadmap, 2: Google Terrain
+  int    mapStyle   = 0;      // 0: ArcGIS Dark Gray (초경량), 1: Google Roadmap (경량)
 
   int    unitDist   = 0;      // 0: km, 1: nm
   int    unitAlt    = 1;      // 0: m,  1: ft
   int    unitSpeed  = 1;      // 0: km/h, 1: kt
-  int    viewMode   = 0;      // 0: Flight radar, 1: Weather view, 2: Clock view
+  int    viewMode   = 0;      // 0: Flight radar, 1: Weather view
 
   bool   showMapBg     = true;
   bool   showScanLine  = true;
@@ -92,13 +105,13 @@ struct RadarConfig {
   bool   wxWind        = true;
   bool   wxPressure    = true;
 
-  // Clock
-  int    clockStyle    = 0;   // 0:Rolex, 1:Longines, 2:Breitling, 3:Omega, 4:DigModern, 5:DigNeon, 6:DigFlip
+  // Timezone
   String tzPosix       = "KST-9";
   String tzLabel       = "SEOUL (UTC+9)";
 
-  // System
+  // System & OTA
   int    brightness    = 85;
+  bool   autoOtaCheck  = false;
 };
 
 struct WeatherData {
@@ -121,7 +134,11 @@ struct WeatherData {
 
 RadarConfig cfg;
 WeatherData wxData, pendingWxData;
-bool pendingWxReady = false, wxFetchInProgress = false;
+volatile bool pendingWxReady     = false;
+volatile bool wxFetchInProgress  = false;
+volatile bool fetchInProgress    = false;
+volatile bool mapFetchInProgress = false;
+
 unsigned long lastWxFetchTime = 0;
 const unsigned long WX_FETCH_INTERVAL = 600000UL;
 
@@ -130,10 +147,9 @@ WebServer server(80);
 DNSServer dnsServer;
 bool isApMode = false;
 
-int    currentMapZoom     = 8;
-float  effectiveRangeKm   = 100.0f;
-bool   mapLoaded          = false;
-bool   mapFetchInProgress = false;
+int   currentMapZoom   = 8;
+float effectiveRangeKm = 100.0f;
+bool  mapLoaded        = false;
 
 // PSRAM을 사용하는 ArduinoJson 커스텀 할당자 (v6 / v7 자동 호환)
 #if ARDUINOJSON_VERSION_MAJOR >= 7
@@ -264,13 +280,14 @@ void st7701_init_panel() {
 }
 
 // ==========================================
-// 3. LovyanGFX Panel_RGB 구성
+// 3. LovyanGFX Panel_RGB + GT911 터치 구성
 // ==========================================
 class LGFX : public lgfx::LGFX_Device {
 public:
-  lgfx::Bus_RGB   _bus;
-  lgfx::Panel_RGB _panel;
-  lgfx::Light_PWM _light;
+  lgfx::Bus_RGB     _bus;
+  lgfx::Panel_RGB   _panel;
+  lgfx::Light_PWM   _light;
+  lgfx::Touch_GT911 _touch;
 
   LGFX(void) {
     {
@@ -291,7 +308,7 @@ public:
       c.pin_d15 = GPIO_NUM_0;
       c.pin_henable = GPIO_NUM_18; c.pin_vsync = GPIO_NUM_17;
       c.pin_hsync   = GPIO_NUM_16; c.pin_pclk  = GPIO_NUM_21;
-      c.freq_write = 8000000;
+      c.freq_write = 6000000; // 6MHz로 하향 (화면 좌우 흔들림/DMA 충돌 방지)
       c.hsync_polarity = 1; c.hsync_front_porch = 10; c.hsync_pulse_width = 8; c.hsync_back_porch = 50;
       c.vsync_polarity = 1; c.vsync_front_porch = 10; c.vsync_pulse_width = 8; c.vsync_back_porch = 20;
       c.pclk_active_neg = 0; c.de_idle_high = 0; c.pclk_idle_high = 0;
@@ -303,6 +320,22 @@ public:
       c.pin_bl = GPIO_NUM_38; c.freq = 44100; c.pwm_channel = 7;
       _light.config(c);
       _panel.setLight(&_light);
+    }
+    {
+      auto c = _touch.config();
+      c.x_min = 0;   c.x_max = 479;
+      c.y_min = 0;   c.y_max = 479;
+      c.pin_int  = -1;
+      c.pin_rst  = -1;
+      c.bus_shared = false;
+      c.offset_rotation = 0;
+      c.i2c_port = 0;
+      c.i2c_addr = 0x5D;
+      c.pin_sda  = GPIO_NUM_19;
+      c.pin_scl  = GPIO_NUM_45;
+      c.freq     = 400000;
+      _touch.config(c);
+      _panel.setTouch(&_touch);
     }
     setPanel(&_panel);
   }
@@ -327,9 +360,15 @@ const int SWEEP_SPEED = 40;
 uint16_t greenBright, green, greenDim, greenDark;
 uint16_t colSeaBg, colRiver, colAirport, colCardBg, colWxPanel, colWxBorder;
 
+// 전방 선언
 void startAircraftFetchBackground();
 void startWeatherFetchBackground();
 void startMapFetchBackground();
+void runApSetupPortal();
+
+bool isAnyHttpsBusy() {
+  return (mapFetchInProgress || fetchInProgress || wxFetchInProgress);
+}
 
 // ==========================================
 // 4. NVS 설정 불러오기 / 저장
@@ -347,11 +386,11 @@ void loadConfig() {
   cfg.minAltFt      = preferences.getInt("minAlt", 0);
   cfg.maxAltFt      = preferences.getInt("maxAlt", 60000);
   cfg.maxAc         = preferences.getInt("maxAc", 24);
-  cfg.mapStyle      = preferences.getInt("mapSty", 0);
+  cfg.mapStyle      = constrain(preferences.getInt("mapSty", 0), 0, 1);
   cfg.unitDist      = preferences.getInt("uDist", 0);
   cfg.unitAlt       = preferences.getInt("uAlt", 1);
   cfg.unitSpeed     = preferences.getInt("uSpd", 1);
-  cfg.viewMode      = preferences.getInt("viewM", 0);
+  cfg.viewMode      = constrain(preferences.getInt("viewM", 0), 0, 1);
   cfg.showMapBg     = preferences.getBool("sMap", true);
   cfg.showScanLine  = preferences.getBool("sScan", true);
   cfg.showCallsign  = preferences.getBool("sCall", true);
@@ -374,11 +413,10 @@ void loadConfig() {
   cfg.wxWind        = preferences.getBool("wxWnd", true);
   cfg.wxPressure    = preferences.getBool("wxPrs", true);
 
-  cfg.clockStyle    = preferences.getInt("clkSty", 0);
   cfg.tzPosix       = preferences.getString("tzPos", "KST-9");
   cfg.tzLabel       = preferences.getString("tzLbl", "SEOUL (UTC+9)");
-
   cfg.brightness    = preferences.getInt("brt", 85);
+  cfg.autoOtaCheck  = preferences.getBool("autoOta", false);
   preferences.end();
 }
 
@@ -422,16 +460,15 @@ void saveConfig() {
   preferences.putBool("wxWnd", cfg.wxWind);
   preferences.putBool("wxPrs", cfg.wxPressure);
 
-  preferences.putInt("clkSty", cfg.clockStyle);
   preferences.putString("tzPos", cfg.tzPosix);
   preferences.putString("tzLbl", cfg.tzLabel);
-
   preferences.putInt("brt", cfg.brightness);
+  preferences.putBool("autoOta", cfg.autoOtaCheck);
   preferences.end();
 }
 
 // ==========================================
-// 5. Google Maps 타일 + RainViewer 강수 레이더 다운로드
+// 5. 초경량 지도 타일 (ArcGIS Dark / Google Roadmap) + RainViewer
 // ==========================================
 double deg2radD(double d) { return d * M_PI / 180.0; }
 double rad2degD(double r) { return r * 180.0 / M_PI; }
@@ -448,9 +485,22 @@ int calcAutoZoom(double lat, float radiusKm, bool isWeather) {
   double worldKmAtLat = 40075.016686 * cos(latRad);
   double idealScale = (worldKmAtLat * (double)R) / (256.0 * (double)radiusKm);
   int z = (int)round(log2(idealScale));
-  // ★ RainViewer 무료 타일은 최대 z=7까지만 지원 ("zoom level not supported" 방지)
   if (isWeather) return constrain(z, 5, 7);
   return constrain(z, 6, 12);
+}
+
+void dimMapSprite(float factor) {
+  uint16_t* buf = (uint16_t*)mapBgSprite.getBuffer();
+  if (!buf) return;
+  uint32_t total = (uint32_t)SCREEN_W * (uint32_t)SCREEN_H;
+  uint16_t scale = (uint16_t)(factor * 256.0f);
+  for (uint32_t i = 0; i < total; i++) {
+    uint16_t p = __builtin_bswap16(buf[i]);
+    uint16_t r = (((p >> 11) & 0x1F) * scale) >> 8;
+    uint16_t g = (((p >> 5)  & 0x3F) * scale) >> 8;
+    uint16_t b = ((p         & 0x1F) * scale) >> 8;
+    buf[i] = __builtin_bswap16((r << 11) | (g << 5) | b);
+  }
 }
 
 bool downloadAndDrawTile(WiFiClientSecure &client, const String &url, int drawX, int drawY) {
@@ -465,7 +515,7 @@ bool downloadAndDrawTile(WiFiClientSecure &client, const String &url, int drawX,
     int code = http.GET();
     if (code == 200) {
       int len = http.getSize();
-      if (len > 100 && len < 180000) {
+      if (len > 100 && len < 150000) {
         uint8_t* buf = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
         if (buf) {
           WiFiClient* stream = http.getStreamPtr();
@@ -545,8 +595,6 @@ void fetchMapTiles() {
   client.setInsecure();
   client.setTimeout(10);
 
-  String rvPath = isWx ? getRainViewerPath(client) : "";
-
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
       int tx = (centerTx + dx + maxTile) % maxTile;
@@ -557,37 +605,116 @@ void fetchMapTiles() {
       int drawY = CY + (int)round((centerTy + dy) * 256.0 - homePy);
       if (drawX >= SCREEN_W || drawY >= SCREEN_H || drawX + 256 <= 0 || drawY + 256 <= 0) continue;
 
-      // Google Maps 타일 (y: 위성 하이브리드, m: 로드맵, p: 지형도)
-      const char* lyrs = (cfg.mapStyle == 1) ? "m" : ((cfg.mapStyle == 2) ? "p" : "y");
-      String url = "https://mt1.google.com/vt/lyrs=" + String(lyrs) + "&hl=ko&x=" + String(tx) + "&y=" + String(ty) + "&z=" + String(z);
+      String url = (cfg.mapStyle == 1)
+        ? "https://mt1.google.com/vt/lyrs=m&hl=ko&x=" + String(tx) + "&y=" + String(ty) + "&z=" + String(z)
+        : "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/" + String(z) + "/" + String(ty) + "/" + String(tx);
 
-      if (downloadAndDrawTile(client, url, drawX, drawY)) {
-        okCount++;
-      }
-
-      if (isWx && rvPath.length() > 0 && z <= 7) {
-        String rvUrl = "https://tilecache.rainviewer.com" + rvPath + "/256/" + String(z) + "/" + String(tx) + "/" + String(ty) + "/2/1_1.png";
-        downloadAndDrawTile(client, rvUrl, drawX, drawY);
-      }
+      if (downloadAndDrawTile(client, url, drawX, drawY)) okCount++;
       delay(15);
     }
   }
 
   if (okCount > 0) {
+    dimMapSprite(cfg.mapStyle == 1 ? 0.45f : 0.75f);
+  }
+
+  if (isWx && z <= 7) {
+    String rvPath = getRainViewerPath(client);
+    if (rvPath.length() > 0) {
+      for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+          int tx = (centerTx + dx + maxTile) % maxTile;
+          int ty = centerTy + dy;
+          if (ty < 0 || ty >= maxTile) continue;
+
+          int drawX = CX + (int)round((centerTx + dx) * 256.0 - homePx);
+          int drawY = CY + (int)round((centerTy + dy) * 256.0 - homePy);
+          if (drawX >= SCREEN_W || drawY >= SCREEN_H || drawX + 256 <= 0 || drawY + 256 <= 0) continue;
+
+          String rvUrl = "https://tilecache.rainviewer.com" + rvPath + "/256/" + String(z) + "/" + String(tx) + "/" + String(ty) + "/2/1_1.png";
+          downloadAndDrawTile(client, rvUrl, drawX, drawY);
+          delay(15);
+        }
+      }
+    }
+  }
+
+  if (okCount > 0) {
     mapLoaded = true;
-    Serial.printf("[MAP] Google Maps loaded %d tiles (z=%d, range=%.1fkm)\n", okCount, z, effectiveRangeKm);
+    Serial.printf("[MAP] Loaded %d lightweight tiles (style=%d, z=%d, range=%.1fkm)\n", okCount, cfg.mapStyle, z, effectiveRangeKm);
   }
 }
 
 void mapFetchTask(void *parameter) { fetchMapTiles(); mapFetchInProgress = false; vTaskDelete(NULL); }
 void startMapFetchBackground() {
-  if (mapFetchInProgress) return;
+  if (isAnyHttpsBusy()) return;
   mapFetchInProgress = true;
   xTaskCreatePinnedToCore(mapFetchTask, "mapFetchTask", 24576, NULL, 1, NULL, 0);
 }
 
 // ==========================================
-// 6. RADAR 360 웹 콘솔 HTML (실시간 미리 보기 포함)
+// 6. GitHub OTA 버전 확인 및 수동 원격 업데이트
+// ==========================================
+bool checkGitHubVersion() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(10);
+
+  HTTPClient http;
+  http.setConnectTimeout(6000);
+  http.setTimeout(8000);
+  if (!http.begin(client, GITHUB_VERSION_URL)) return false;
+
+  bool ok = false;
+  if (http.GET() == 200) {
+    String payload = http.getString();
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
+    StaticJsonDocument<512> doc;
+#endif
+    if (!deserializeJson(doc, payload)) {
+      otaLatestVer = doc["version"] | FW_VERSION;
+      otaBinUrl    = doc["url"] | "";
+      otaAvailable = (otaLatestVer != String(FW_VERSION) && otaBinUrl.length() > 10);
+      ok = true;
+      Serial.printf("[OTA] Current: %s, Latest: %s (Avail: %d)\n", FW_VERSION, otaLatestVer.c_str(), otaAvailable);
+    }
+  }
+  http.end();
+  return ok;
+}
+
+void performGitHubOTA() {
+  if (otaBinUrl.length() < 10) return;
+
+  lcd.fillScreen(TFT_BLACK);
+  lcd.drawRect(12, 12, 456, 456, colRiver);
+  lcd.setTextDatum(middle_center);
+  lcd.setTextSize(3); lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+  lcd.drawString("OTA UPDATING...", CX, 190);
+  lcd.setTextSize(2); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.drawString(String(FW_VERSION) + " -> " + otaLatestVer, CX, 240);
+  lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  lcd.drawString("Do NOT turn off power!", CX, 290);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  t_httpUpdate_return ret = httpUpdate.update(client, otaBinUrl);
+  if (ret == HTTP_UPDATE_FAILED) {
+    Serial.printf("[OTA] Failed (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+    lcd.setTextColor(TFT_RED, TFT_BLACK);
+    lcd.drawString("Update Failed!", CX, 340);
+    delay(3000);
+  }
+}
+
+// ==========================================
+// 7. RADAR 360 웹 콘솔 HTML (IP 주소 표시 + 캐시 방지)
 // ==========================================
 const char WEB_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -608,15 +735,12 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
   .brand p { margin:2px 0 0; font-size:12px; color:var(--muted); }
   .status { text-align:right; font-size:12px; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#ffd54f; margin-right:5px; }
-
-  /* 실시간 미리 보기 카드 */
   .preview-box { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px; margin-bottom:14px; display:flex; flex-direction:column; align-items:center; }
   .preview-head { width:100%; display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; font-size:12px; color:var(--muted); }
   .preview-badge { background:#16332c; color:var(--accent); padding:3px 9px; border-radius:20px; font-weight:600; font-size:11px; }
   #previewCanvas { width:260px; height:260px; border-radius:12px; border:2px solid #264d44; background:#000; box-shadow:0 8px 24px rgba(0,0,0,0.5); }
-
   .tabs { display:flex; background:var(--card); border:1px solid var(--border); border-radius:10px; padding:4px; margin-bottom:14px; gap:4px; flex-wrap:wrap; }
-  .tab { flex:1; min-width:70px; text-align:center; padding:9px 4px; border-radius:7px; cursor:pointer; font-size:13px; color:var(--muted); border:none; background:transparent; }
+  .tab { flex:1; min-width:75px; text-align:center; padding:9px 4px; border-radius:7px; cursor:pointer; font-size:13px; color:var(--muted); border:none; background:transparent; }
   .tab.active { background:#16332c; color:var(--accent); font-weight:600; }
   .panel { display:none; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-bottom:16px; }
   .panel.active { display:block; }
@@ -649,7 +773,7 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
       <div class="logo">360</div>
       <div>
         <h1>RADAR 360</h1>
-        <p>Flight Radar · Live Weather · Luxury Clock</p>
+        <p>Flight Radar & Live Weather Console</p>
       </div>
     </div>
     <div class="status">
@@ -658,10 +782,9 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
-  <!-- 실시간 480x480 화면 미리 보기 -->
   <div class="preview-box">
     <div class="preview-head">
-      <span>LCD Live Preview (480 × 480)</span>
+      <span>LCD Live Preview (480 × 480 · Lightweight Map)</span>
       <span class="preview-badge" id="pvModeLabel">FLIGHT RADAR</span>
     </div>
     <canvas id="previewCanvas" width="480" height="480"></canvas>
@@ -671,12 +794,10 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
     <button class="tab active" onclick="openTab('net',this)">Network</button>
     <button class="tab" onclick="openTab('radar',this)">Radar</button>
     <button class="tab" onclick="openTab('wx',this)">Weather</button>
-    <button class="tab" onclick="openTab('clk',this)">Clock</button>
     <button class="tab" onclick="openTab('sys',this)">System</button>
   </div>
 
   <form id="cfgForm" onsubmit="saveAll(event)">
-    <!-- NETWORK -->
     <div id="tab-net" class="panel active">
       <h2>WI-FI Setup</h2>
       <div class="grid">
@@ -687,15 +808,15 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
         <label>Device hostname</label>
         <input type="text" id="hostname" name="hostname" value="radar">
         <div class="hint">접속 주소: http://<span id="hostPreview">radar</span>.local</div>
+        <div class="hint">IP 주소: http://<span id="ipPreview">-</span></div>
       </div>
       <button type="button" class="btn" onclick="scanWifi()">Scan networks</button>
       <span class="hint" style="margin-left:8px;">Wi-Fi 또는 호스트명 변경 시 재부팅됩니다.</span>
       <div id="scanList" class="scan-list"></div>
     </div>
 
-    <!-- RADAR -->
     <div id="tab-radar" class="panel">
-      <h2>Location & Google Maps</h2>
+      <h2>Location & Lightweight Map</h2>
       <div class="grid">
         <div class="field">
           <label>Airport Presets</label>
@@ -725,11 +846,10 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
           </select>
         </div>
         <div class="field">
-          <label>Google Map style</label>
+          <label>Map style (초경량)</label>
           <select id="mapStyle" name="mapStyle">
-            <option value="0">Google Satellite Hybrid (위성 지도)</option>
-            <option value="1">Google Roadmap (일반 지도)</option>
-            <option value="2">Google Terrain (지형 지도)</option>
+            <option value="0">ArcGIS Dark Gray (초경량 다크 지도)</option>
+            <option value="1">Google Roadmap (경량 일반 지도)</option>
           </select>
         </div>
         <div class="field"><label>Latitude (WGS-84)</label><input type="number" id="lat" name="lat" step="0.0001"></div>
@@ -751,7 +871,6 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
           <select id="viewMode" name="viewMode" onchange="syncViewMode(this.value)">
             <option value="0">Flight radar (항공기 레이더)</option>
             <option value="1">Weather view (실시간 날씨)</option>
-            <option value="2">Clock view (시계 화면)</option>
           </select>
         </div>
       </div>
@@ -769,7 +888,6 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
       </div>
     </div>
 
-    <!-- WEATHER -->
     <div id="tab-wx" class="panel">
       <h2>Display Mode</h2>
       <div class="field">
@@ -777,17 +895,14 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
         <select id="wxViewMode" onchange="syncViewMode(this.value)">
           <option value="0">Flight radar (항공기 레이더)</option>
           <option value="1">Weather view (실시간 날씨 + 강수 레이더)</option>
-          <option value="2">Clock view (시계 화면)</option>
         </select>
       </div>
-
       <h2 style="margin-top:18px;">Weather Location</h2>
       <label class="chk" style="margin-bottom:12px;"><input type="checkbox" id="wxUseRadarLoc" name="wxUseRadarLoc" onchange="toggleWxLoc()"> Use radar location</label>
       <div class="grid">
         <div class="field"><label>Weather latitude (WGS-84)</label><input type="number" id="wxLat" name="wxLat" step="0.0001"></div>
         <div class="field"><label>Weather longitude (WGS-84)</label><input type="number" id="wxLon" name="wxLon" step="0.0001"></div>
       </div>
-
       <h2 style="margin-top:18px;">Weather Cards</h2>
       <div class="grid">
         <div class="field"><label>Temperature unit</label><select id="unitTemp" name="unitTemp"><option value="0">Celsius °C</option><option value="1">Fahrenheit °F</option></select></div>
@@ -803,56 +918,6 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
       </div>
     </div>
 
-    <!-- CLOCK -->
-    <div id="tab-clk" class="panel">
-      <h2>Clock Display Mode</h2>
-      <div class="field">
-        <label>화면 표시 모드 선택</label>
-        <select id="clkViewMode" onchange="syncViewMode(this.value)">
-          <option value="0">Flight radar (항공기 레이더)</option>
-          <option value="1">Weather view (실시간 날씨)</option>
-          <option value="2">Clock view (시계 화면)</option>
-        </select>
-      </div>
-
-      <h2 style="margin-top:18px;">Watch Face & Timezone</h2>
-      <div class="grid">
-        <div class="field">
-          <label>시계 화면 스타일 선택</label>
-          <select id="clockStyle" name="clockStyle">
-            <optgroup label="아날로그 명품 시계 (Analog)">
-              <option value="0">ROLEX (Submariner Black)</option>
-              <option value="1">LONGINES (Master Classic White)</option>
-              <option value="2">BREITLING (Navitimer Chrono)</option>
-              <option value="3">OMEGA (Seamaster Deep Blue)</option>
-            </optgroup>
-            <optgroup label="디지털 시계 (Digital)">
-              <option value="4">Digital Modern (시간 + 날짜 + 기온)</option>
-              <option value="5">Digital Neon Ring (원형 초침 게이지)</option>
-              <option value="6">Digital Retro Flip (플립 시계 스타일)</option>
-            </optgroup>
-          </select>
-        </div>
-        <div class="field">
-          <label>지역별 시간대 (Timezone)</label>
-          <select id="tzPosix" name="tzPosix" onchange="updateTzLabel()">
-            <option value="KST-9"   data-lbl="SEOUL (UTC+9)"      data-off="9">대한민국 서울/부산 (UTC+9)</option>
-            <option value="JST-9"   data-lbl="TOKYO (UTC+9)"      data-off="9">일본 도쿄 (UTC+9)</option>
-            <option value="SGT-8"   data-lbl="SINGAPORE (UTC+8)"  data-off="8">싱가포르 / 홍콩 (UTC+8)</option>
-            <option value="ICT-7"   data-lbl="BANGKOK (UTC+7)"    data-off="7">태국 방콕 (UTC+7)</option>
-            <option value="GST-4"   data-lbl="DUBAI (UTC+4)"      data-off="4">아랍에미리트 두바이 (UTC+4)</option>
-            <option value="GMT0"    data-lbl="LONDON (UTC+0)"     data-off="0">영국 런던 (UTC+0)</option>
-            <option value="CET-1"   data-lbl="PARIS (UTC+1)"      data-off="1">프랑스 파리 / 독일 (UTC+1)</option>
-            <option value="EST5"    data-lbl="NEW YORK (UTC-5)"   data-off="-5">미국 뉴욕 (UTC-5)</option>
-            <option value="PST8"    data-lbl="LOS ANGELES (UTC-8)" data-off="-8">미국 LA (UTC-8)</option>
-            <option value="AEST-10" data-lbl="SYDNEY (UTC+10)"    data-off="10">호주 시드니 (UTC+10)</option>
-          </select>
-          <input type="hidden" id="tzLabel" name="tzLabel" value="SEOUL (UTC+9)">
-        </div>
-      </div>
-    </div>
-
-    <!-- SYSTEM -->
     <div id="tab-sys" class="panel">
       <h2>Display</h2>
       <div class="field">
@@ -860,6 +925,17 @@ const char WEB_HTML[] PROGMEM = R"rawliteral(
         <input type="range" id="brightness" name="brightness" min="10" max="100" style="width:100%;accent-color:var(--accent);"
                oninput="document.getElementById('brtVal').innerText=this.value">
       </div>
+
+      <h2 style="margin-top:20px;">Remote Firmware Update (GitHub)</h2>
+      <div class="hint" style="margin-bottom:8px;">Current Version: <b id="fwCur" style="color:var(--accent)">-</b> · Status: <span id="otaMsg">Not checked</span></div>
+      <button type="button" class="btn" onclick="checkOta()">Check GitHub</button>
+      <button type="button" class="btn btn-primary" id="btnOtaRun" style="display:none;margin-left:8px;padding:10px 16px;" onclick="runGithubOta()">Update Now</button>
+
+      <h2 style="margin-top:20px;">Local Firmware Update (.bin)</h2>
+      <input type="file" id="binFile" accept=".bin" style="margin-bottom:8px;color:var(--muted);">
+      <br>
+      <button type="button" class="btn" onclick="uploadBin()">Start Local Update</button>
+
       <h2 style="margin-top:20px;">Device</h2>
       <p class="hint" style="margin-bottom:12px;">Factory reset은 저장된 Wi-Fi 및 모든 설정을 초기화하고 설정 모드로 재부팅합니다.</p>
       <button type="button" class="btn" onclick="deviceAction('/api/restart','재부팅 하시겠습니까?')">Restart</button>
@@ -881,29 +957,20 @@ const PRESETS = {
 };
 const CHKS = ['showMapBg','showScanLine','showCallsign','showAltitude','showHeading','showSpeed','showDistance','showAcType','showVectors',
               'wxUseRadarLoc','wxShowCards','wxFeelsLike','wxPrecip','wxHumidity','wxWind','wxPressure'];
-
 let pvSweep = 45;
+let currentIpStr = '-';
 
 function openTab(id, el) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + id).classList.add('active');
   el.classList.add('active');
-  // 탭 클릭 시 해당 화면 미리 보기로 자동 포커스
   if (id === 'radar') syncViewMode('0');
   else if (id === 'wx') syncViewMode('1');
-  else if (id === 'clk') syncViewMode('2');
 }
 function syncViewMode(v) {
   document.getElementById('viewMode').value = v;
   document.getElementById('wxViewMode').value = v;
-  document.getElementById('clkViewMode').value = v;
-  drawPreview();
-}
-function updateTzLabel() {
-  const sel = document.getElementById('tzPosix');
-  const opt = sel.options[sel.selectedIndex];
-  document.getElementById('tzLabel').value = opt.getAttribute('data-lbl') || 'LOCAL';
   drawPreview();
 }
 function applyPreset() {
@@ -929,17 +996,6 @@ function toggleWxLoc() {
   drawPreview();
 }
 
-// ==========================================
-// 실시간 480x480 Canvas 미리 보기 렌더러
-// ==========================================
-function getTzDate() {
-  const sel = document.getElementById('tzPosix');
-  const off = parseFloat(sel.options[sel.selectedIndex]?.getAttribute('data-off') || '9');
-  const now = new Date();
-  const utc = now.getTime() + now.getTimezoneOffset() * 60000;
-  return new Date(utc + off * 3600000);
-}
-
 function drawPreview() {
   const cv = document.getElementById('previewCanvas');
   if (!cv) return;
@@ -949,40 +1005,29 @@ function drawPreview() {
 
   const vm = parseInt(document.getElementById('viewMode').value || '0');
   const preset = document.getElementById('preset').value || 'INCHEON';
-  const tzLbl = document.getElementById('tzLabel').value || 'SEOUL (UTC+9)';
-  const d = getTzDate();
-  const hr = d.getHours(), mn = d.getMinutes(), sc = d.getSeconds();
+  const now = new Date();
   const pad = n => String(n).padStart(2, '0');
+  const hm = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  const hms = `${hm}:${pad(now.getSeconds())}`;
 
   ctx.clearRect(0, 0, 480, 480);
-
   if (vm === 0) {
     document.getElementById('pvModeLabel').innerText = 'FLIGHT RADAR';
-    drawRadarPreview(ctx, preset, tzLbl, `${pad(hr)}:${pad(mn)}:${pad(sc)}`);
-  } else if (vm === 1) {
-    document.getElementById('pvModeLabel').innerText = 'WEATHER VIEW';
-    drawWeatherPreview(ctx, preset, `${pad(hr)}:${pad(mn)}`);
+    drawRadarPreview(ctx, preset, hms);
   } else {
-    document.getElementById('pvModeLabel').innerText = 'CLOCK VIEW';
-    drawClockPreview(ctx, hr, mn, sc, d.getDate(), d.getFullYear(), d.getMonth() + 1, tzLbl, preset);
+    document.getElementById('pvModeLabel').innerText = 'WEATHER VIEW';
+    drawWeatherPreview(ctx, preset, hm);
   }
 }
 
-function drawRadarPreview(ctx, preset, tzLbl, timeStr) {
+function drawRadarPreview(ctx, preset, timeStr) {
   const showMap = document.getElementById('showMapBg').checked;
-  const mapSty = parseInt(document.getElementById('mapStyle').value || '0');
-  ctx.fillStyle = !showMap ? '#000' : (mapSty === 1 ? '#1e3545' : (mapSty === 2 ? '#1c3329' : '#0c1c2c'));
+  ctx.fillStyle = !showMap ? '#000' : '#060e16';
   ctx.fillRect(0, 0, 480, 480);
-
   if (showMap) {
-    // 모의 지형/도로 느낌
-    ctx.fillStyle = mapSty === 1 ? '#2c4a3e' : '#162b24';
+    ctx.fillStyle = '#0c1813';
     ctx.beginPath(); ctx.arc(310, 220, 170, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#3cc0ff55'; ctx.lineWidth = 4;
-    ctx.beginPath(); ctx.moveTo(150, 260); ctx.quadraticCurveTo(250, 210, 390, 240); ctx.stroke();
   }
-
-  // 스캔 라인
   if (document.getElementById('showScanLine').checked) {
     const rad = (pvSweep - 90) * Math.PI / 180;
     const grd = ctx.createRadialGradient(240, 240, 10, 240, 240, 222);
@@ -992,273 +1037,136 @@ function drawRadarPreview(ctx, preset, tzLbl, timeStr) {
     ctx.strokeStyle = '#00ff3c'; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(240, 240); ctx.lineTo(240 + Math.cos(rad)*222, 240 + Math.sin(rad)*222); ctx.stroke();
   }
-
-  // 레이더 원 & 십자선
   ctx.strokeStyle = '#147837'; ctx.lineWidth = 1;
   for (let i = 1; i <= 4; i++) { ctx.beginPath(); ctx.arc(240, 240, 44 * i, 0, Math.PI * 2); ctx.stroke(); }
   ctx.strokeStyle = '#00ff3c'; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.arc(240, 240, 222, 0, Math.PI * 2); ctx.stroke();
-  ctx.strokeStyle = '#147837'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(18, 240); ctx.lineTo(462, 240); ctx.moveTo(240, 18); ctx.lineTo(240, 462); ctx.stroke();
 
-  // 거리 눈금
-  const rKm = parseFloat(document.getElementById('radiusKm').value || '100');
-  const uDist = parseInt(document.getElementById('unitDist').value || '0');
-  ctx.fillStyle = '#00ff3c'; ctx.font = '12px monospace';
-  for (let i = 1; i <= 4; i++) {
-    const v = (rKm / 5) * i;
-    ctx.fillText(uDist === 1 ? Math.round(v / 1.852) + 'nm' : Math.round(v) + 'km', 246, 240 - 44 * i - 4);
-  }
-
-  // 샘플 항공기 3대
   const acs = [
-    { x: 165, y: 155, hdg: 125, col: '#00e6ff', fl: 'KAL901', typ: 'B77W', alt: 34000, spd: 460, dst: 42 },
-    { x: 315, y: 195, hdg: 245, col: '#32ff32', fl: 'AAR202', typ: 'A359', alt: 18500, spd: 320, dst: 28 },
-    { x: 265, y: 310, hdg: 35,  col: '#ffeb00', fl: 'JNA105', typ: 'B738', alt: 6200,  spd: 210, dst: 31 }
+    { x: 165, y: 155, hdg: 125, col: '#00e6ff', fl: 'KAL901', alt: 34000, spd: 460 },
+    { x: 315, y: 195, hdg: 245, col: '#32ff32', fl: 'AAR202', alt: 18500, spd: 320 }
   ];
   const uAlt = parseInt(document.getElementById('unitAlt').value || '1');
   const uSpd = parseInt(document.getElementById('unitSpeed').value || '1');
   acs.forEach(a => {
-    if (document.getElementById('showVectors').checked) {
-      const tr = (a.hdg - 90) * Math.PI / 180;
-      ctx.strokeStyle = a.col; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(a.x + Math.cos(tr)*24, a.y + Math.sin(tr)*24); ctx.stroke();
-    }
     ctx.save(); ctx.translate(a.x, a.y); ctx.rotate(a.hdg * Math.PI / 180);
     ctx.fillStyle = a.col;
     ctx.beginPath(); ctx.moveTo(0,-12); ctx.lineTo(3,-3); ctx.lineTo(12,3); ctx.lineTo(12,5); ctx.lineTo(2,2);
     ctx.lineTo(2,8); ctx.lineTo(6,11); ctx.lineTo(-6,11); ctx.lineTo(-2,8); ctx.lineTo(-2,2);
     ctx.lineTo(-12,5); ctx.lineTo(-12,3); ctx.lineTo(-3,-3); ctx.closePath(); ctx.fill();
     ctx.restore();
-
-    let ly = a.y - 6;
-    ctx.font = 'bold 12px monospace';
-    let l1 = '';
-    if (document.getElementById('showCallsign').checked) l1 += a.fl;
-    if (document.getElementById('showAcType').checked) l1 += (l1 ? ' ' : '') + '[' + a.typ + ']';
-    if (l1) { ctx.fillStyle = '#fff'; ctx.fillText(l1, a.x + 14, ly); ly += 13; }
-    let l2 = '';
-    if (document.getElementById('showAltitude').checked) l2 += uAlt === 1 ? a.alt + 'ft' : Math.round(a.alt * 0.3048) + 'm';
-    if (document.getElementById('showSpeed').checked) l2 += (l2 ? ' ' : '') + (uSpd === 1 ? a.spd + 'kt' : Math.round(a.spd * 1.852) + 'k/h');
-    if (l2) { ctx.fillStyle = '#ffeb3b'; ctx.fillText(l2, a.x + 14, ly); ly += 13; }
-    let l3 = '';
-    if (document.getElementById('showHeading').checked) l3 += 'H:' + a.hdg + ' ';
-    if (document.getElementById('showDistance').checked) l3 += uDist === 1 ? (a.dst / 1.852).toFixed(1) + 'nm' : a.dst + 'km';
-    if (l3) { ctx.fillStyle = '#3cc0ff'; ctx.fillText(l3, a.x + 14, ly); }
+    let ly = a.y - 6; ctx.font = 'bold 12px monospace';
+    if (document.getElementById('showCallsign').checked) { ctx.fillStyle = '#fff'; ctx.fillText(a.fl, a.x + 14, ly); ly += 13; }
+    if (document.getElementById('showAltitude').checked) { ctx.fillStyle = '#ffeb3b'; ctx.fillText((uAlt===1?a.alt+'ft':Math.round(a.alt*0.3048)+'m')+' '+(uSpd===1?a.spd+'kt':Math.round(a.spd*1.852)+'k/h'), a.x + 14, ly); }
   });
 
-  // 상단/하단 오버레이
   ctx.fillStyle = '#000'; ctx.strokeStyle = '#00ff3c'; ctx.lineWidth = 2;
   ctx.fillRect(6, 6, 110, 44); ctx.strokeRect(6, 6, 110, 44);
-  ctx.fillStyle = '#00ff3c'; ctx.font = 'bold 16px monospace'; ctx.fillText('ADS-B', 14, 24); ctx.fillText('AC:3', 14, 43);
+  ctx.fillStyle = '#00ff3c'; ctx.font = 'bold 16px monospace'; ctx.fillText('ADS-B', 14, 24); ctx.fillText('AC:2', 14, 43);
 
   ctx.fillStyle = '#000'; ctx.fillRect(360, 6, 114, 40); ctx.strokeRect(360, 6, 114, 40);
   ctx.fillStyle = '#ffeb3b'; ctx.font = 'bold 16px monospace'; ctx.fillText(timeStr, 370, 26);
-  ctx.fillStyle = '#00ff3c'; ctx.font = '10px monospace'; ctx.fillText(tzLbl.slice(0, 15), 370, 40);
 
-  if (document.getElementById('wxShowCards').checked) {
-    const uTmp = parseInt(document.getElementById('unitTemp').value || '0');
-    ctx.fillStyle = '#0a161a'; ctx.strokeStyle = '#3cc0ff';
-    ctx.fillRect(6, 414, 154, 60); ctx.strokeRect(6, 414, 154, 60);
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 18px monospace'; ctx.fillText(uTmp === 1 ? '61.2F' : '16.2C', 14, 435);
-    ctx.fillStyle = '#3cc0ff'; ctx.font = '11px monospace'; ctx.fillText('H:68% W 4kt', 14, 452);
-    ctx.fillStyle = '#00ff3c'; ctx.fillText('P:0.0mm 1014hPa', 14, 466);
-  }
-
-  ctx.fillStyle = '#000'; ctx.strokeStyle = '#00ff3c';
-  ctx.fillRect(344, 434, 130, 40); ctx.strokeRect(344, 434, 130, 40);
-  ctx.fillStyle = '#00ff3c'; ctx.font = 'bold 18px monospace'; ctx.fillText(preset, 354, 455);
-  ctx.fillStyle = '#ffeb3b'; ctx.font = '11px monospace'; ctx.fillText((document.getElementById('hostname').value || 'radar') + '.local', 354, 469);
+  ctx.fillStyle = '#000'; ctx.fillRect(344, 422, 130, 52); ctx.strokeRect(344, 422, 130, 52);
+  ctx.fillStyle = '#00ff3c'; ctx.font = 'bold 16px monospace'; ctx.fillText(preset, 354, 440);
+  ctx.fillStyle = '#ffeb3b'; ctx.font = '10px monospace'; ctx.fillText((document.getElementById('hostname').value || 'radar') + '.local', 354, 454);
+  ctx.fillStyle = '#3cc0ff'; ctx.fillText(currentIpStr, 354, 467);
 }
 
 function drawWeatherPreview(ctx, preset, hmStr) {
-  ctx.fillStyle = '#0c2036'; ctx.fillRect(0, 0, 480, 480);
-  // 모의 강수 레이더 구름
-  const g1 = ctx.createRadialGradient(170, 250, 10, 170, 250, 140);
-  g1.addColorStop(0, 'rgba(255,220,0,0.65)'); g1.addColorStop(0.4, 'rgba(0,220,120,0.5)'); g1.addColorStop(1, 'rgba(0,90,255,0)');
+  ctx.fillStyle = '#06101b'; ctx.fillRect(0, 0, 480, 480);
+  const g1 = ctx.createRadialGradient(180, 250, 10, 180, 250, 130);
+  g1.addColorStop(0, 'rgba(255,220,0,0.8)'); g1.addColorStop(0.5, 'rgba(0,220,120,0.55)'); g1.addColorStop(1, 'rgba(0,90,255,0)');
   ctx.fillStyle = g1; ctx.fillRect(0, 0, 480, 480);
 
   ctx.fillStyle = '#fff'; ctx.font = 'bold 20px sans-serif'; ctx.textAlign = 'center';
   ctx.fillText('WEATHER   ' + hmStr, 240, 36);
-
-  // Live / Latest 배지
-  ctx.fillStyle = '#12482a'; ctx.strokeStyle = '#00ff3c'; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.roundRect(92, 52, 96, 26, 13); ctx.fill(); ctx.stroke();
-  ctx.fillStyle = '#00ff3c'; ctx.font = 'bold 14px sans-serif'; ctx.fillText('Live', 140, 70);
-
-  ctx.fillStyle = '#143a6c'; ctx.strokeStyle = '#3cc0ff';
-  ctx.beginPath(); ctx.roundRect(292, 52, 96, 26, 13); ctx.fill(); ctx.stroke();
-  ctx.fillStyle = '#3cc0ff'; ctx.fillText('Latest', 340, 70);
-
-  const uTmp = parseInt(document.getElementById('unitTemp').value || '0');
-  const uPrc = parseInt(document.getElementById('unitPrecip').value || '0');
-  const tStr = uTmp === 1 ? '61°F' : '16°C', fStr = uTmp === 1 ? '~ 63°F' : '~ 17°C';
-  const pStr = uPrc === 1 ? '0.1 in' : '2.4 mm';
-
-  // 좌측/우측 카드
   ctx.fillStyle = 'rgba(16,26,36,0.92)'; ctx.strokeStyle = '#3a5c74';
   ctx.beginPath(); ctx.roundRect(44, 92, 188, 108, 12); ctx.fill(); ctx.stroke();
   ctx.beginPath(); ctx.roundRect(248, 92, 188, 108, 12); ctx.fill(); ctx.stroke();
-
-  ctx.textAlign = 'left';
-  ctx.fillStyle = '#fff'; ctx.font = 'bold 30px sans-serif'; ctx.fillText(tStr, 118, 132);
-  ctx.fillStyle = '#aaa'; ctx.font = '18px sans-serif'; ctx.fillText(fStr, 118, 160);
-  ctx.fillStyle = '#3cc0ff'; ctx.font = 'bold 16px sans-serif'; ctx.fillText('💧 ' + pStr, 62, 186);
-
-  ctx.fillStyle = '#fff'; ctx.font = 'bold 16px sans-serif'; ctx.fillText('H:89%  C:100%', 262, 124);
-  ctx.fillStyle = '#00ff3c'; ctx.fillText('W 4kt  G13kt', 262, 154);
-  ctx.fillStyle = '#ffeb3b'; ctx.fillText('1004 hPa  5nm', 262, 184);
-
-  // 하단 3일 예보
-  ctx.fillStyle = 'rgba(16,26,36,0.92)'; ctx.strokeStyle = '#3a5c74';
   ctx.beginPath(); ctx.roundRect(54, 312, 372, 98, 12); ctx.fill(); ctx.stroke();
-  const days = [['Today', '18/10', '98%'], ['Tmrw', '13/6', '40%'], ['Day 3', '17/11', '77%']];
-  ctx.textAlign = 'center';
-  days.forEach((it, i) => {
-    const cx = 117 + i * 123;
-    ctx.fillStyle = '#bbb'; ctx.font = '15px sans-serif'; ctx.fillText(it[0], cx, 336);
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 20px sans-serif'; ctx.fillText(it[1], cx, 368);
-    ctx.fillStyle = '#3cc0ff'; ctx.font = '14px sans-serif'; ctx.fillText('💧 ' + it[2], cx, 396);
-  });
-
-  // Light ~ Heavy 바
-  const bar = ctx.createLinearGradient(170, 0, 310, 0);
-  bar.addColorStop(0, '#1e64ff'); bar.addColorStop(0.5, '#1ef030'); bar.addColorStop(1, '#ff301e');
-  ctx.fillStyle = bar; ctx.fillRect(170, 424, 140, 8);
-  ctx.fillStyle = '#fff'; ctx.font = '14px sans-serif';
-  ctx.fillText('Light', 142, 433); ctx.fillText('Heavy', 340, 433);
-  ctx.fillStyle = '#00ff3c'; ctx.font = 'bold 18px sans-serif'; ctx.fillText(preset, 240, 462);
-  ctx.textAlign = 'left';
-}
-
-function drawClockPreview(ctx, hr, mn, sc, day, yr, mo, tzLbl, preset) {
-  const sty = parseInt(document.getElementById('clockStyle').value || '0');
-  const pad = n => String(n).padStart(2, '0');
-  ctx.textAlign = 'center';
-
-  const drawHand = (deg, len, w, col) => {
-    const rad = (deg - 90) * Math.PI / 180;
-    ctx.strokeStyle = col; ctx.lineWidth = w; ctx.lineCap = 'round';
-    ctx.beginPath(); ctx.moveTo(240, 240); ctx.lineTo(240 + Math.cos(rad)*len, 240 + Math.sin(rad)*len); ctx.stroke();
-  };
-  const hA = (hr % 12) * 30 + mn * 0.5, mA = mn * 6 + sc * 0.1, sA = sc * 6;
-
-  if (sty <= 3) {
-    const bg = sty === 1 ? '#f2f0e8' : (sty === 2 ? '#0c162a' : (sty === 3 ? '#0a2656' : '#000'));
-    const rim = sty === 2 ? '#fff' : (sty === 1 ? '#b4b9c0' : (sty === 3 ? '#0c306c' : '#161a1c'));
-    ctx.fillStyle = rim; ctx.beginPath(); ctx.arc(240, 240, 228, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = bg;  ctx.beginPath(); ctx.arc(240, 240, 190, 0, Math.PI * 2); ctx.fill();
-
-    for (let i = 0; i < 12; i++) {
-      const r = (i * 30 - 90) * Math.PI / 180;
-      ctx.fillStyle = sty === 1 ? '#111' : '#fff';
-      ctx.beginPath(); ctx.arc(240 + Math.cos(r)*162, 240 + Math.sin(r)*162, i % 3 === 0 ? 7 : 5, 0, Math.PI * 2); ctx.fill();
-    }
-    const brands = ['ROLEX', 'LONGINES', 'BREITLING', 'OMEGA'];
-    const bCols  = ['#dcbe5a', '#111', '#f0c832', '#fff'];
-    ctx.fillStyle = bCols[sty]; ctx.font = 'bold 26px serif'; ctx.fillText(brands[sty], 240, 165);
-    ctx.fillStyle = sty === 1 ? '#555' : '#aaa'; ctx.font = '13px sans-serif'; ctx.fillText(tzLbl, 240, 325);
-
-    if (sty === 2) {
-      ctx.fillStyle = '#fff';
-      [[-74,0],[74,0],[0,74]].forEach(p => { ctx.beginPath(); ctx.arc(240+p[0], 240+p[1], 36, 0, Math.PI*2); ctx.fill(); });
-    }
-    const hc = sty === 1 ? '#1241a5' : '#fff';
-    const scCol = sty === 0 ? '#00ff3c' : (sty === 1 ? '#1241a5' : '#ff3333');
-    drawHand(hA, 105, 10, hc); drawHand(mA, 152, 7, hc); drawHand(sA, 168, 3, scCol);
-    ctx.fillStyle = hc; ctx.beginPath(); ctx.arc(240, 240, 8, 0, Math.PI * 2); ctx.fill();
-  } else if (sty === 4) {
-    ctx.fillStyle = '#0a161a'; ctx.fillRect(0, 0, 480, 480);
-    ctx.strokeStyle = '#3cc0ff'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(240, 240, 224, 0, Math.PI*2); ctx.stroke();
-    ctx.fillStyle = '#3cc0ff'; ctx.font = 'bold 20px sans-serif'; ctx.fillText(tzLbl, 240, 115);
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 78px monospace'; ctx.fillText(`${pad(hr)}:${pad(mn)}`, 215, 250);
-    ctx.fillStyle = '#00ff3c'; ctx.font = 'bold 34px monospace'; ctx.fillText(`:${pad(sc)}`, 368, 250);
-    ctx.fillStyle = '#ffeb3b'; ctx.font = 'bold 26px monospace'; ctx.fillText(`${yr}-${pad(mo)}-${pad(day)}`, 240, 320);
-    ctx.fillStyle = '#bbb'; ctx.font = '18px sans-serif'; ctx.fillText(`${preset}  16.2°C  H:68%`, 240, 372);
-  } else if (sty === 5) {
-    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 480, 480);
-    for (let i = 0; i < 60; i++) {
-      const r = (i * 6 - 90) * Math.PI / 180;
-      ctx.strokeStyle = i <= sc ? '#00ff3c' : '#142d23'; ctx.lineWidth = 4;
-      ctx.beginPath(); ctx.moveTo(240+Math.cos(r)*198, 240+Math.sin(r)*198); ctx.lineTo(240+Math.cos(r)*222, 240+Math.sin(r)*222); ctx.stroke();
-    }
-    ctx.fillStyle = '#00ff3c'; ctx.font = 'bold 58px monospace'; ctx.fillText(`${pad(hr)}:${pad(mn)}:${pad(sc)}`, 240, 245);
-    ctx.fillStyle = '#3cc0ff'; ctx.font = 'bold 18px sans-serif'; ctx.fillText(tzLbl, 240, 300);
-  } else {
-    ctx.fillStyle = '#121214'; ctx.fillRect(0, 0, 480, 480);
-    ctx.fillStyle = '#22242a'; ctx.strokeStyle = '#5a5f69'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.roundRect(42, 130, 184, 190, 16); ctx.fill(); ctx.stroke();
-    ctx.beginPath(); ctx.roundRect(254, 130, 184, 190, 16); ctx.fill(); ctx.stroke();
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 96px monospace';
-    ctx.fillText(pad(hr), 134, 255); ctx.fillText(pad(mn), 346, 255);
-    ctx.strokeStyle = '#000'; ctx.lineWidth = 4;
-    ctx.beginPath(); ctx.moveTo(42,225); ctx.lineTo(226,225); ctx.moveTo(254,225); ctx.lineTo(438,225); ctx.stroke();
-    ctx.fillStyle = '#ffeb3b'; ctx.font = 'bold 20px monospace'; ctx.fillText(`SEC ${pad(sc)} · ${tzLbl}`, 240, 375);
-  }
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 30px sans-serif'; ctx.fillText(document.getElementById('unitTemp').value==='1'?'61°F':'16°C', 138, 145);
+  ctx.font = 'bold 16px sans-serif'; ctx.fillText('H:89%  W 4kt', 342, 145);
+  ctx.fillStyle = '#00ff3c'; ctx.font = 'bold 18px sans-serif'; ctx.fillText(preset, 240, 456);
   ctx.textAlign = 'left';
 }
 
 document.getElementById('cfgForm').addEventListener('input', drawPreview);
 document.getElementById('cfgForm').addEventListener('change', drawPreview);
-document.getElementById('hostname').addEventListener('input', e => {
-  document.getElementById('hostPreview').innerText = e.target.value || 'radar';
-});
+document.getElementById('hostname').addEventListener('input', e => { document.getElementById('hostPreview').innerText = e.target.value || 'radar'; });
 
 async function loadState() {
-  const r = await fetch('/api/config');
+  const r = await fetch('/api/config', { cache: 'no-store' });
   const d = await r.json();
+  currentIpStr = d.ip || '-';
   document.getElementById('stMode').innerText = d.apMode ? 'Wi-Fi setup' : 'Connected';
   document.getElementById('stDot').style.background = d.apMode ? '#ffd54f' : '#5effc3';
   document.getElementById('stIp').innerText = d.ip;
-
+  document.getElementById('ipPreview').innerText = d.ip;
+  document.getElementById('fwCur').innerText = d.fwVer || '-';
   ['ssid','hostname','preset','mapStyle','lat','lon','radiusKm','refreshSec','minAltFt','maxAltFt','maxAc',
-   'unitDist','unitAlt','unitSpeed','viewMode','wxLat','wxLon','unitTemp','unitPrecip','clockStyle','tzPosix','tzLabel','brightness']
+   'unitDist','unitAlt','unitSpeed','viewMode','wxLat','wxLon','unitTemp','unitPrecip','brightness']
     .forEach(k => { if (document.getElementById(k)) document.getElementById(k).value = d[k]; });
   syncViewMode(String(d.viewMode));
   document.getElementById('hostPreview').innerText = d.hostname;
   document.getElementById('brtVal').innerText = d.brightness;
-  CHKS.forEach(k => document.getElementById(k).checked = d[k]);
-  toggleWxLoc();
-  drawPreview();
+  CHKS.forEach(k => { if (document.getElementById(k)) document.getElementById(k).checked = d[k]; });
+  toggleWxLoc(); drawPreview();
 }
 
 async function scanWifi() {
   const list = document.getElementById('scanList');
-  list.style.display = 'block';
-  list.innerHTML = '<div class="scan-item">스캔 중...</div>';
-  const r = await fetch('/api/scan');
-  const arr = await r.json();
+  list.style.display = 'block'; list.innerHTML = '<div class="scan-item">스캔 중...</div>';
+  const r = await fetch('/api/scan', { cache: 'no-store' }); const arr = await r.json();
   if (!arr.length) { list.innerHTML = '<div class="scan-item">검색된 Wi-Fi 없음</div>'; return; }
-  list.innerHTML = arr.map(n =>
-    `<div class="scan-item" onclick="document.getElementById('ssid').value='${n.ssid}'"><span>${n.ssid}</span><span>${n.rssi} dBm</span></div>`
-  ).join('');
+  list.innerHTML = arr.map(n => `<div class="scan-item" onclick="document.getElementById('ssid').value='${n.ssid}'"><span>${n.ssid}</span><span>${n.rssi} dBm</span></div>`).join('');
+}
+
+async function checkOta() {
+  document.getElementById('otaMsg').innerText = 'Checking GitHub...';
+  const r = await fetch('/api/ota_check', { cache: 'no-store' });
+  const d = await r.json();
+  document.getElementById('fwCur').innerText = d.current;
+  if (d.available) {
+    document.getElementById('otaMsg').innerText = 'New version available: ' + d.latest;
+    document.getElementById('btnOtaRun').style.display = 'inline-block';
+  } else {
+    document.getElementById('otaMsg').innerText = 'Up to date (' + d.latest + ')';
+    document.getElementById('btnOtaRun').style.display = 'none';
+  }
+}
+
+async function runGithubOta() {
+  if (!confirm('GitHub 최신 버전으로 업데이트하시겠습니까?')) return;
+  await fetch('/api/ota_github', { method: 'POST' });
+  alert('업데이트를 시작합니다. 기기 화면을 확인해 주세요.');
+}
+
+async function uploadBin() {
+  const f = document.getElementById('binFile').files[0];
+  if (!f) { alert('.bin 파일을 선택해 주세요.'); return; }
+  const fd = new FormData();
+  fd.append('update', f);
+  document.getElementById('otaMsg').innerText = 'Uploading .bin...';
+  const r = await fetch('/api/ota_upload', { method: 'POST', body: fd });
+  const txt = await r.text();
+  alert(r.ok && txt === 'OK' ? '업로드 완료! 기기가 재부팅됩니다. 10초 후 새로고침하세요.' : '업데이트 실패 (' + txt + ')');
 }
 
 async function saveAll(e) {
   e.preventDefault();
-  document.getElementById('wxLat').disabled = false;
-  document.getElementById('wxLon').disabled = false;
-  updateTzLabel();
+  document.getElementById('wxLat').disabled = false; document.getElementById('wxLon').disabled = false;
   const params = new URLSearchParams();
-  const fields = ['ssid','pass','hostname','preset','mapStyle','lat','lon','radiusKm','refreshSec','minAltFt','maxAltFt','maxAc',
-                  'unitDist','unitAlt','unitSpeed','viewMode','wxLat','wxLon','unitTemp','unitPrecip','clockStyle','tzPosix','tzLabel','brightness'];
-  fields.forEach(k => {
-    const el = document.getElementById(k);
-    if (el) params.append(k, el.value);
-  });
-  CHKS.forEach(k => params.append(k, document.getElementById(k).checked ? '1' : '0'));
+  ['ssid','pass','hostname','preset','mapStyle','lat','lon','radiusKm','refreshSec','minAltFt','maxAltFt','maxAc',
+   'unitDist','unitAlt','unitSpeed','viewMode','wxLat','wxLon','unitTemp','unitPrecip','brightness']
+    .forEach(k => { const el = document.getElementById(k); if (el) params.append(k, el.value); });
+  CHKS.forEach(k => { const el = document.getElementById(k); if (el) params.append(k, el.checked ? '1' : '0'); });
   toggleWxLoc();
-
-  const r = await fetch('/api/save', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString()
-  });
+  const r = await fetch('/api/save', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:params.toString() });
   const res = await r.json();
   const t = document.getElementById('toast');
   t.innerText = res.reboot ? '저장 완료! 재부팅 중...' : '설정이 즉시 적용되었습니다!';
-  t.style.display = 'block';
-  setTimeout(() => t.style.display = 'none', 3000);
+  t.style.display = 'block'; setTimeout(() => t.style.display = 'none', 3000);
 }
 
 async function deviceAction(url, msg) {
@@ -1266,7 +1174,6 @@ async function deviceAction(url, msg) {
   await fetch(url, { method:'POST' });
   alert('요청을 처리했습니다. 기기가 재부팅됩니다.');
 }
-
 setInterval(() => { pvSweep = (pvSweep + 6) % 360; drawPreview(); }, 250);
 loadState();
 </script>
@@ -1281,6 +1188,7 @@ void setupWebServer() {
     String j = "{";
     j += "\"apMode\":" + String(isApMode ? "true" : "false") + ",";
     j += "\"ip\":\"" + (isApMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\",";
+    j += "\"fwVer\":\"" + String(FW_VERSION) + "\",";
     j += "\"ssid\":\"" + cfg.ssid + "\",\"hostname\":\"" + cfg.hostname + "\",\"preset\":\"" + cfg.presetName + "\",";
     j += "\"mapStyle\":" + String(cfg.mapStyle) + ",\"lat\":" + String(cfg.lat, 4) + ",\"lon\":" + String(cfg.lon, 4) + ",\"radiusKm\":" + String(cfg.radiusKm, 0) + ",";
     j += "\"refreshSec\":" + String(cfg.refreshSec) + ",\"minAltFt\":" + String(cfg.minAltFt) + ",\"maxAltFt\":" + String(cfg.maxAltFt) + ",\"maxAc\":" + String(cfg.maxAc) + ",";
@@ -1295,7 +1203,6 @@ void setupWebServer() {
     j += "\"wxShowCards\":" + String(cfg.wxShowCards ? "true" : "false") + ",\"wxFeelsLike\":" + String(cfg.wxFeelsLike ? "true" : "false") + ",";
     j += "\"wxPrecip\":" + String(cfg.wxPrecip ? "true" : "false") + ",\"wxHumidity\":" + String(cfg.wxHumidity ? "true" : "false") + ",";
     j += "\"wxWind\":" + String(cfg.wxWind ? "true" : "false") + ",\"wxPressure\":" + String(cfg.wxPressure ? "true" : "false") + ",";
-    j += "\"clockStyle\":" + String(cfg.clockStyle) + ",\"tzPosix\":\"" + cfg.tzPosix + "\",\"tzLabel\":\"" + cfg.tzLabel + "\",";
     j += "\"brightness\":" + String(cfg.brightness) + "}";
     server.send(200, "application/json", j);
   });
@@ -1317,12 +1224,10 @@ void setupWebServer() {
   });
 
   server.on("/api/save", HTTP_POST, []() {
-    bool needReboot = false;
-    bool mapChanged = false;
+    bool needReboot = false, mapChanged = false;
     double oldLat = cfg.lat, oldLon = cfg.lon;
     float  oldRad = cfg.radiusKm;
-    int    oldSty = cfg.mapStyle;
-    int    oldView = cfg.viewMode;
+    int    oldSty = cfg.mapStyle, oldView = cfg.viewMode;
 
     String newSsid = server.arg("ssid"); newSsid.trim();
     String newPass = server.arg("pass");
@@ -1335,7 +1240,7 @@ void setupWebServer() {
     cfg.hostname = newHost;
 
     if (server.hasArg("preset"))     cfg.presetName = server.arg("preset");
-    if (server.hasArg("mapStyle"))   cfg.mapStyle   = server.arg("mapStyle").toInt();
+    if (server.hasArg("mapStyle"))   cfg.mapStyle   = constrain(server.arg("mapStyle").toInt(), 0, 1);
     if (server.hasArg("lat"))        cfg.lat        = server.arg("lat").toDouble();
     if (server.hasArg("lon"))        cfg.lon        = server.arg("lon").toDouble();
     if (server.hasArg("radiusKm"))   cfg.radiusKm   = constrain(server.arg("radiusKm").toFloat(), 10.0f, 200.0f);
@@ -1346,7 +1251,7 @@ void setupWebServer() {
     if (server.hasArg("unitDist"))   cfg.unitDist   = server.arg("unitDist").toInt();
     if (server.hasArg("unitAlt"))    cfg.unitAlt    = server.arg("unitAlt").toInt();
     if (server.hasArg("unitSpeed"))  cfg.unitSpeed  = server.arg("unitSpeed").toInt();
-    if (server.hasArg("viewMode"))   cfg.viewMode   = server.arg("viewMode").toInt();
+    if (server.hasArg("viewMode"))   cfg.viewMode   = constrain(server.arg("viewMode").toInt(), 0, 1);
 
     cfg.showMapBg     = (server.arg("showMapBg") == "1");
     cfg.showScanLine  = (server.arg("showScanLine") == "1");
@@ -1369,10 +1274,6 @@ void setupWebServer() {
     cfg.wxHumidity    = (server.arg("wxHumidity") == "1");
     cfg.wxWind        = (server.arg("wxWind") == "1");
     cfg.wxPressure    = (server.arg("wxPressure") == "1");
-
-    if (server.hasArg("clockStyle")) cfg.clockStyle = server.arg("clockStyle").toInt();
-    if (server.hasArg("tzPosix"))    cfg.tzPosix    = server.arg("tzPosix");
-    if (server.hasArg("tzLabel"))    cfg.tzLabel    = server.arg("tzLabel");
     if (server.hasArg("brightness")) cfg.brightness = constrain(server.arg("brightness").toInt(), 10, 100);
 
     if (fabs(oldLat - cfg.lat) > 0.0001 || fabs(oldLon - cfg.lon) > 0.0001 ||
@@ -1382,16 +1283,50 @@ void setupWebServer() {
 
     saveConfig();
     lcd.setBrightness(map(cfg.brightness, 10, 100, 25, 255));
-    configTzTime(cfg.tzPosix.c_str(), "pool.ntp.org", "time.nist.gov");
 
     if (!isApMode) {
-      if (mapChanged && cfg.viewMode != 2) startMapFetchBackground();
-      if (cfg.viewMode == 0) startAircraftFetchBackground();
-      startWeatherFetchBackground();
+      if (mapChanged) startMapFetchBackground();
+      lastApiFetchTime = millis() - ((unsigned long)cfg.refreshSec * 1000UL);
+      lastWxFetchTime  = millis() - WX_FETCH_INTERVAL + 4000UL;
     }
 
     server.send(200, "application/json", needReboot ? "{\"reboot\":true}" : "{\"reboot\":false}");
     if (needReboot || isApMode) { delay(1200); ESP.restart(); }
+  });
+
+  // OTA API 라우트
+  server.on("/api/ota_check", HTTP_GET, []() {
+    checkGitHubVersion();
+    String j = "{\"current\":\"" + String(FW_VERSION) + "\",\"latest\":\"" + otaLatestVer +
+               "\",\"available\":" + String(otaAvailable ? "true" : "false") + "}";
+    server.send(200, "application/json", j);
+  });
+
+  server.on("/api/ota_github", HTTP_POST, []() {
+    if (otaAvailable && otaBinUrl.length() > 10) {
+      server.send(200, "application/json", "{\"ok\":true}");
+      otaTriggerFlag = true;
+    } else {
+      server.send(400, "application/json", "{\"ok\":false}");
+    }
+  });
+
+  server.on("/api/ota_upload", HTTP_POST, []() {
+    bool ok = !Update.hasError();
+    server.send(200, "text/plain", ok ? "OK" : Update.errorString());
+    if (ok) { delay(800); ESP.restart(); }
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      lcd.fillScreen(TFT_BLACK);
+      lcd.setTextDatum(middle_center); lcd.setTextSize(3); lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+      lcd.drawString("LOCAL OTA...", CX, 220);
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      Update.write(upload.buf, upload.currentSize);
+    } else if (upload.status == UPLOAD_FILE_END) {
+      Update.end(true);
+    }
   });
 
   server.on("/api/restart", HTTP_POST, []() { server.send(200, "text/plain", "OK"); delay(500); ESP.restart(); });
@@ -1408,7 +1343,9 @@ void setupWebServer() {
 
 void runApSetupPortal() {
   isApMode = true;
+  lcd.setBrightness(80);
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.softAP(AP_SSID);
   delay(200);
   IPAddress apIP = WiFi.softAPIP();
@@ -1429,7 +1366,7 @@ void runApSetupPortal() {
 }
 
 // ==========================================
-// 7. 실시간 날씨 + 3일 예보 API (Open-Meteo)
+// 8. 실시간 날씨 + 3일 예보 API (Open-Meteo)
 // ==========================================
 const char* degToCompass(int deg) {
   const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
@@ -1487,7 +1424,7 @@ void fetchWeatherData() {
 
 void weatherFetchTask(void *parameter) { fetchWeatherData(); wxFetchInProgress = false; vTaskDelete(NULL); }
 void startWeatherFetchBackground() {
-  if (wxFetchInProgress) return;
+  if (isAnyHttpsBusy()) return;
   wxFetchInProgress = true;
   xTaskCreatePinnedToCore(weatherFetchTask, "weatherFetchTask", 16384, NULL, 1, NULL, 0);
 }
@@ -1497,7 +1434,7 @@ void applyPendingWeatherData() {
 }
 
 // ==========================================
-// 8. 전 세계 주요 공항 마커 및 ADS-B 수신
+// 9. 전 세계 주요 공항 마커 및 ADS-B 수신
 // ==========================================
 const char* AIRPORT_CODES[] = {
   "RKSI","RKPK","RKPC","RJAA","RJTT","WSSS","VHHH","VTBS","OMDB","YSSY","EGLL","LFPG","EDDF","KJFK","KLAX"
@@ -1518,7 +1455,8 @@ struct AircraftPoint {
 const int MAX_PLANES = 40;
 AircraftPoint planes[MAX_PLANES], pendingPlanes[MAX_PLANES];
 int planeCount = 0, pendingPlaneCount = 0;
-bool apiOk = false, pendingApiOk = false, fetchInProgress = false, pendingDataReady = false;
+bool apiOk = false, pendingApiOk = false;
+volatile bool pendingDataReady = false;
 String apiStatusMsg = "WAIT...";
 
 float angleDiffBehindSweep(float s, float b) {
@@ -1587,7 +1525,7 @@ bool tryFetchFromUrl(const String &url, const char* serverTag) {
 
   if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) { apiStatusMsg = "JSON ERR"; return false; }
 
-  AircraftPoint tempPlanes[MAX_PLANES];
+  static AircraftPoint tempPlanes[MAX_PLANES];
   int tempCount = 0, limitCount = min(cfg.maxAc, MAX_PLANES);
   float rangeLim = mapLoaded ? effectiveRangeKm : cfg.radiusKm;
   JsonArray arr = doc["ac"].as<JsonArray>();
@@ -1634,7 +1572,7 @@ void fetchAircraftData() {
 
 void aircraftFetchTask(void *parameter) { fetchAircraftData(); fetchInProgress = false; vTaskDelete(NULL); }
 void startAircraftFetchBackground() {
-  if (fetchInProgress) return;
+  if (isAnyHttpsBusy()) return;
   fetchInProgress = true;
   xTaskCreatePinnedToCore(aircraftFetchTask, "aircraftFetchTask", 24576, NULL, 1, NULL, 0);
 }
@@ -1648,228 +1586,291 @@ void applyPendingAircraftData() {
 }
 
 // ==========================================
-// 9. 시계 화면 렌더링 (명품 아날로그 4종 + 디지털 3종)
+// 10. 터치 UI (VIEW / SET 버튼 + 3탭 설정 화면)
 // ==========================================
-void drawThickHand(float angleDeg, int len, int tailLen, int halfW, uint16_t col) {
-  float rad = (angleDeg - 90.0f) * DEG_TO_RAD;
-  float perp = rad + M_PI / 2.0f;
-  int tx = CX + cos(rad) * len, ty = CY + sin(rad) * len;
-  int bx = CX - cos(rad) * tailLen, by = CY - sin(rad) * tailLen;
-  int lx = bx + cos(perp) * halfW, ly = by + sin(perp) * halfW;
-  int rx = bx - cos(perp) * halfW, ry = by - sin(perp) * halfW;
-  radarCanvas.fillTriangle(tx, ty, lx, ly, rx, ry, col);
+bool showRegionMenu   = false;
+bool showViewMenu     = false;
+bool showSettingsMenu = false;
+int  settingsTab      = 0; // 0:RADAR, 1:WEATHER, 2:SYSTEM
+unsigned long lastTouchTime = 0;
+
+struct TouchPreset {
+  const char* name; double lat; double lon; const char* tzPosix; const char* tzLabel;
+};
+const TouchPreset TOUCH_PRESETS[9] = {
+  {"INCHEON",   37.4602, 126.4407, "KST-9", "SEOUL (UTC+9)"},
+  {"BUSAN",     35.1795, 128.9382, "KST-9", "BUSAN (UTC+9)"},
+  {"JEJU",      33.5113, 126.4930, "KST-9", "JEJU (UTC+9)"},
+  {"NARITA",    35.7720, 140.3929, "JST-9", "TOKYO (UTC+9)"},
+  {"SINGAPORE",  1.3644, 103.9915, "SGT-8", "SINGAPORE (UTC+8)"},
+  {"HONGKONG",  22.3080, 113.9185, "SGT-8", "HONGKONG (UTC+8)"},
+  {"LONDON",    51.4700,  -0.4543, "GMT0",  "LONDON (UTC+0)"},
+  {"PARIS",     49.0097,   2.5479, "CET-1", "PARIS (UTC+1)"},
+  {"NEWYORK",   40.6413, -73.7781, "EST5",  "NEW YORK (UTC-5)"}
+};
+const char* MAP_NAMES[2] = {"DARK GRAY", "ROADMAP"};
+
+void drawTopActionButtons() {
+  int vx = (cfg.viewMode == 1) ? 10 : 145;
+  int vy = (cfg.viewMode == 1) ? 16 : 6;
+  int vw = (cfg.viewMode == 1) ? 74 : 90;
+
+  int sx = (cfg.viewMode == 1) ? 396 : 245;
+  int sy = vy;
+  int sw = vw;
+
+  radarCanvas.fillRoundRect(vx, vy, vw, 30, 8, colWxPanel);
+  radarCanvas.drawRoundRect(vx, vy, vw, 30, 8, greenBright);
+  radarCanvas.setTextDatum(middle_center);
+  radarCanvas.setTextSize(2); radarCanvas.setTextColor(greenBright);
+  radarCanvas.drawString("VIEW", vx + vw / 2, vy + 15);
+
+  radarCanvas.fillRoundRect(sx, sy, sw, 30, 8, colWxPanel);
+  radarCanvas.drawRoundRect(sx, sy, sw, 30, 8, colRiver);
+  radarCanvas.setTextColor(colRiver);
+  radarCanvas.drawString("SET", sx + sw / 2, sy + 15);
 }
 
-void drawClockView() {
-  struct tm ti;
-  bool hasTime = getLocalTime(&ti);
-  int hr = hasTime ? ti.tm_hour : 10;
-  int mn = hasTime ? ti.tm_min  : 10;
-  int sc = hasTime ? ti.tm_sec  : 30;
-  int day = hasTime ? ti.tm_mday : 23;
+void drawSettingsMenuOverlay() {
+  if (!showSettingsMenu) return;
 
-  float secAng  = sc * 6.0f;
-  float minAng  = mn * 6.0f + sc * 0.1f;
-  float hourAng = (hr % 12) * 30.0f + mn * 0.5f;
+  radarCanvas.fillRoundRect(14, 14, 452, 452, 14, colWxPanel);
+  radarCanvas.drawRoundRect(14, 14, 452, 452, 14, greenBright);
 
-  radarCanvas.fillScreen(TFT_BLACK);
+  radarCanvas.setTextDatum(middle_center);
+  radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_YELLOW);
+  radarCanvas.drawString("RADAR 360 SETTINGS", CX, 34);
 
-  // ---- [0] ROLEX Submariner ----
-  if (cfg.clockStyle == 0) {
-    uint16_t bezelCol = radarCanvas.color565(18, 22, 24);
-    uint16_t goldCol  = radarCanvas.color565(220, 190, 90);
-    radarCanvas.fillCircle(CX, CY, 232, radarCanvas.color565(90, 96, 102));
-    radarCanvas.fillCircle(CX, CY, 224, bezelCol);
-    radarCanvas.fillCircle(CX, CY, 190, TFT_BLACK);
-    radarCanvas.drawCircle(CX, CY, 190, radarCanvas.color565(150, 155, 160));
-
-    // 베젤 눈금
-    for (int i = 0; i < 60; i++) {
-      float rad = (i * 6 - 90) * DEG_TO_RAD;
-      int r1 = (i % 5 == 0) ? 200 : 210;
-      radarCanvas.drawLine(CX + cos(rad)*r1, CY + sin(rad)*r1, CX + cos(rad)*218, CY + sin(rad)*218, TFT_WHITE);
-    }
-    // 다이얼 인덱스
-    for (int i = 0; i < 12; i++) {
-      float rad = (i * 30 - 90) * DEG_TO_RAD;
-      int ix = CX + cos(rad) * 162, iy = CY + sin(rad) * 162;
-      if (i == 0) {
-        radarCanvas.fillTriangle(CX, CY - 144, CX - 14, CY - 174, CX + 14, CY - 174, TFT_WHITE);
-      } else if (i == 3) {
-        radarCanvas.fillRoundRect(CX + 132, CY - 16, 40, 32, 5, TFT_WHITE);
-        radarCanvas.setTextDatum(middle_center); radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_BLACK);
-        radarCanvas.drawNumber(day, CX + 152, CY);
-      } else if (i == 6 || i == 9) {
-        radarCanvas.fillCircle(ix, iy, 9, TFT_WHITE);
-      } else {
-        radarCanvas.fillCircle(ix, iy, 8, TFT_WHITE);
-        radarCanvas.drawCircle(ix, iy, 9, goldCol);
-      }
-    }
-    radarCanvas.setTextDatum(middle_center);
-    radarCanvas.setTextSize(3); radarCanvas.setTextColor(goldCol); radarCanvas.drawString("ROLEX", CX, CY - 78);
-    radarCanvas.setTextSize(1); radarCanvas.setTextColor(TFT_LIGHTGREY);
-    radarCanvas.drawString("OYSTER PERPETUAL DATE", CX, CY - 52);
-    radarCanvas.drawString("SUBMARINER", CX, CY + 62);
-    radarCanvas.drawString(cfg.tzLabel, CX, CY + 82);
-
-    drawThickHand(hourAng, 108, 22, 7, TFT_WHITE);
-    drawThickHand(minAng,  156, 26, 5, TFT_WHITE);
-    drawThickHand(secAng,  170, 34, 2, greenBright);
-    radarCanvas.fillCircle(CX, CY, 8, TFT_WHITE);
+  const char* tabNames[3] = {"RADAR", "WEATHER", "SYSTEM"};
+  for (int i = 0; i < 3; i++) {
+    int tx = 26 + i * 145;
+    bool act = (settingsTab == i);
+    radarCanvas.fillRoundRect(tx, 52, 138, 34, 8, act ? radarCanvas.color565(18, 72, 42) : TFT_BLACK);
+    radarCanvas.drawRoundRect(tx, 52, 138, 34, 8, act ? greenBright : colWxBorder);
+    radarCanvas.setTextSize(2); radarCanvas.setTextColor(act ? greenBright : TFT_LIGHTGREY);
+    radarCanvas.drawString(tabNames[i], tx + 69, 69);
   }
-  // ---- [1] LONGINES Master Classic ----
-  else if (cfg.clockStyle == 1) {
-    uint16_t dialCol = radarCanvas.color565(242, 240, 232);
-    uint16_t blueHand = radarCanvas.color565(18, 65, 165);
-    radarCanvas.fillCircle(CX, CY, 228, radarCanvas.color565(180, 185, 192));
-    radarCanvas.fillCircle(CX, CY, 218, dialCol);
-    radarCanvas.drawCircle(CX, CY, 198, radarCanvas.color565(120, 120, 120));
 
-    for (int i = 0; i < 60; i++) {
-      float rad = (i * 6 - 90) * DEG_TO_RAD;
-      radarCanvas.drawLine(CX + cos(rad)*(i%5==0?188:194), CY + sin(rad)*(i%5==0?188:194), CX + cos(rad)*202, CY + sin(rad)*202, TFT_BLACK);
-    }
-    radarCanvas.setTextDatum(middle_center); radarCanvas.setTextSize(3); radarCanvas.setTextColor(TFT_BLACK);
-    for (int i = 1; i <= 12; i++) {
-      float rad = (i * 30 - 90) * DEG_TO_RAD;
-      radarCanvas.drawNumber(i, CX + cos(rad) * 164, CY + sin(rad) * 164);
-    }
-    radarCanvas.setTextSize(2); radarCanvas.drawString("LONGINES", CX, CY - 74);
-    radarCanvas.setTextSize(1); radarCanvas.drawString("AUTOMATIC", CX, CY + 68);
-    radarCanvas.drawString(cfg.tzLabel, CX, CY + 86);
+  auto drawStepRow = [&](int y, const char* title, String val) {
+    radarCanvas.setTextDatum(middle_left); radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_LIGHTGREY);
+    radarCanvas.drawString(title, 30, y + 22);
+    radarCanvas.fillRoundRect(205, y, 48, 44, 8, TFT_BLACK); radarCanvas.drawRoundRect(205, y, 48, 44, 8, colRiver);
+    radarCanvas.fillRoundRect(402, y, 48, 44, 8, TFT_BLACK); radarCanvas.drawRoundRect(402, y, 48, 44, 8, colRiver);
+    radarCanvas.setTextDatum(middle_center); radarCanvas.setTextColor(TFT_WHITE);
+    radarCanvas.drawString("<", 229, y + 22); radarCanvas.drawString(">", 426, y + 22);
+    radarCanvas.setTextColor(greenBright); radarCanvas.drawString(val, 327, y + 22);
+  };
 
-    drawThickHand(hourAng, 112, 20, 6, blueHand);
-    drawThickHand(minAng,  162, 24, 4, blueHand);
-    drawThickHand(secAng,  176, 32, 2, blueHand);
-    radarCanvas.fillCircle(CX, CY, 7, blueHand);
+  auto drawToggleBtn = [&](int x, int y, int w, int h, String label, bool on) {
+    radarCanvas.fillRoundRect(x, y, w, h, 8, on ? radarCanvas.color565(18, 72, 42) : TFT_BLACK);
+    radarCanvas.drawRoundRect(x, y, w, h, 8, on ? greenBright : colWxBorder);
+    radarCanvas.setTextDatum(middle_center); radarCanvas.setTextSize(2);
+    radarCanvas.setTextColor(on ? greenBright : TFT_LIGHTGREY);
+    radarCanvas.drawString(label, x + w / 2, y + h / 2);
+  };
+
+  if (settingsTab == 0) {
+    drawStepRow(104, "Map Style", MAP_NAMES[constrain(cfg.mapStyle, 0, 1)]);
+    drawStepRow(162, "Radius", String((int)cfg.radiusKm) + " km");
+
+    drawToggleBtn(28,  226, 136, 46, cfg.unitDist == 1 ? "Dist: nm" : "Dist: km", true);
+    drawToggleBtn(172, 226, 136, 46, cfg.unitAlt  == 1 ? "Alt: ft"  : "Alt: m",   true);
+    drawToggleBtn(316, 226, 136, 46, cfg.unitSpeed== 1 ? "Spd: kt"  : "Spd: k/h", true);
+
+    drawToggleBtn(28,  286, 206, 46, "Map BG",    cfg.showMapBg);
+    drawToggleBtn(246, 286, 206, 46, "Scan Line", cfg.showScanLine);
+    drawToggleBtn(28,  342, 206, 46, "Callsign",  cfg.showCallsign);
+    drawToggleBtn(246, 342, 206, 46, "Alt / Spd", cfg.showAltitude);
   }
-  // ---- [2] BREITLING Navitimer ----
-  else if (cfg.clockStyle == 2) {
-    uint16_t navyCol = radarCanvas.color565(12, 22, 42);
-    uint16_t goldCol = radarCanvas.color565(240, 200, 50);
-    radarCanvas.fillCircle(CX, CY, 232, radarCanvas.color565(140, 145, 152));
-    radarCanvas.fillCircle(CX, CY, 224, TFT_WHITE); // 외곽 슬라이드 룰
-    radarCanvas.fillCircle(CX, CY, 184, navyCol);
-
-    for (int i = 0; i < 60; i++) {
-      float rad = (i * 6 - 90) * DEG_TO_RAD;
-      radarCanvas.drawLine(CX + cos(rad)*186, CY + sin(rad)*186, CX + cos(rad)*(i%5==0?218:204), CY + sin(rad)*(i%5==0?218:204), TFT_BLACK);
-    }
-    // 서브 다이얼 3개 (3, 6, 9시)
-    radarCanvas.fillCircle(CX - 76, CY, 40, TFT_WHITE); radarCanvas.drawCircle(CX - 76, CY, 40, goldCol);
-    radarCanvas.fillCircle(CX + 76, CY, 40, TFT_WHITE); radarCanvas.drawCircle(CX + 76, CY, 40, goldCol);
-    radarCanvas.fillCircle(CX, CY + 76, 40, TFT_WHITE); radarCanvas.drawCircle(CX, CY + 76, 40, goldCol);
-
-    radarCanvas.setTextDatum(middle_center);
-    radarCanvas.setTextSize(2); radarCanvas.setTextColor(goldCol); radarCanvas.drawString("BREITLING", CX, CY - 78);
-    radarCanvas.setTextSize(1); radarCanvas.setTextColor(TFT_WHITE); radarCanvas.drawString("1884 · NAVITIMER", CX, CY - 56);
-    radarCanvas.setTextColor(TFT_BLACK); radarCanvas.drawNumber(day, CX + 76, CY);
-    radarCanvas.drawNumber(sc, CX - 76, CY);
-
-    drawThickHand(hourAng, 108, 20, 6, TFT_WHITE);
-    drawThickHand(minAng,  156, 24, 4, TFT_WHITE);
-    drawThickHand(secAng,  174, 34, 2, TFT_RED);
-    radarCanvas.fillCircle(CX, CY, 8, goldCol);
+  else if (settingsTab == 1) {
+    drawToggleBtn(28,  112, 206, 56, cfg.unitTemp == 0 ? "Temp: C" : "Temp: F", true);
+    drawToggleBtn(246, 112, 206, 56, cfg.unitPrecip == 0 ? "Precip: mm" : "Precip: in", true);
+    drawToggleBtn(28,  186, 424, 56, cfg.wxShowCards ? "Radar Weather Card: ON" : "Radar Weather Card: OFF", cfg.wxShowCards);
+    drawToggleBtn(28,  260, 424, 56, cfg.wxUseRadarLoc ? "Use Radar Location: ON" : "Use Radar Location: OFF", cfg.wxUseRadarLoc);
   }
-  // ---- [3] OMEGA Seamaster Deep Blue ----
-  else if (cfg.clockStyle == 3) {
-    uint16_t deepBlue = radarCanvas.color565(10, 38, 86);
-    uint16_t waveCol  = radarCanvas.color565(22, 64, 128);
-    radarCanvas.fillCircle(CX, CY, 232, radarCanvas.color565(150, 158, 168));
-    radarCanvas.fillCircle(CX, CY, 224, radarCanvas.color565(12, 48, 108));
-    radarCanvas.fillCircle(CX, CY, 190, deepBlue);
-
-    // 물결 패턴
-    for (int y = CY - 140; y <= CY + 140; y += 26) {
-      for (int x = CX - 150; x <= CX + 150; x += 6) {
-        int wy = y + (int)(sin(x * 0.08f) * 5.0f);
-        if (hypot(x - CX, wy - CY) < 182) radarCanvas.drawPixel(x, wy, waveCol);
-      }
-    }
-    for (int i = 0; i < 12; i++) {
-      float rad = (i * 30 - 90) * DEG_TO_RAD;
-      radarCanvas.fillCircle(CX + cos(rad)*162, CY + sin(rad)*162, (i%3==0)?9:7, TFT_WHITE);
-    }
-    radarCanvas.setTextDatum(middle_center);
-    radarCanvas.setTextSize(3); radarCanvas.setTextColor(TFT_WHITE); radarCanvas.drawString("OMEGA", CX, CY - 78);
-    radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_RED);   radarCanvas.drawString("Seamaster", CX, CY - 48);
-    radarCanvas.setTextSize(1); radarCanvas.setTextColor(TFT_LIGHTGREY); radarCanvas.drawString(cfg.tzLabel, CX, CY + 76);
-
-    drawThickHand(hourAng, 106, 20, 7, TFT_WHITE);
-    drawThickHand(minAng,  156, 24, 5, TFT_WHITE);
-    drawThickHand(secAng,  172, 34, 2, TFT_RED);
-    radarCanvas.fillCircle(CX, CY, 8, TFT_WHITE);
-  }
-  // ---- [4] Digital Modern ----
-  else if (cfg.clockStyle == 4) {
-    radarCanvas.fillScreen(colCardBg);
-    radarCanvas.drawCircle(CX, CY, 228, colRiver);
-    radarCanvas.setTextDatum(middle_center);
-    radarCanvas.setTextSize(2); radarCanvas.setTextColor(colRiver);
-    radarCanvas.drawString(cfg.tzLabel, CX, 100);
-
-    char hm[8], ss[4], dt[24];
-    sprintf(hm, "%02d:%02d", hr, mn);
-    sprintf(ss, ":%02d", sc);
-    if (hasTime) sprintf(dt, "%04d-%02d-%02d", ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
-    else strcpy(dt, "---- -- --");
-
-    radarCanvas.setTextSize(7); radarCanvas.setTextColor(TFT_WHITE);
-    radarCanvas.drawString(hm, CX - 26, CY - 10);
-    radarCanvas.setTextSize(3); radarCanvas.setTextColor(greenBright);
-    radarCanvas.drawString(ss, CX + 132, CY + 4);
-
-    radarCanvas.setTextSize(3); radarCanvas.setTextColor(TFT_YELLOW);
-    radarCanvas.drawString(dt, CX, CY + 75);
-
-    if (wxData.valid) {
-      float tVal = (cfg.unitTemp == 1) ? (wxData.tempC * 9.0f / 5.0f + 32.0f) : wxData.tempC;
-      radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_LIGHTGREY);
-      radarCanvas.drawString(cfg.presetName + "  " + String(tVal, 1) + (cfg.unitTemp==1?"F":"C") + "  H:" + String(wxData.humidity) + "%", CX, CY + 130);
-    }
-  }
-  // ---- [5] Digital Neon Ring ----
-  else if (cfg.clockStyle == 5) {
-    radarCanvas.fillScreen(TFT_BLACK);
-    for (int i = 0; i < 60; i++) {
-      float rad = (i * 6 - 90) * DEG_TO_RAD;
-      uint16_t c = (i <= sc) ? greenBright : radarCanvas.color565(20, 45, 35);
-      radarCanvas.drawLine(CX + cos(rad)*200, CY + sin(rad)*200, CX + cos(rad)*222, CY + sin(rad)*222, c);
-    }
-    char hms[12]; sprintf(hms, "%02d:%02d:%02d", hr, mn, sc);
-    radarCanvas.setTextDatum(middle_center);
-    radarCanvas.setTextSize(5); radarCanvas.setTextColor(greenBright);
-    radarCanvas.drawString(hms, CX, CY - 10);
-    radarCanvas.setTextSize(2); radarCanvas.setTextColor(colRiver);
-    radarCanvas.drawString(cfg.tzLabel, CX, CY + 56);
-  }
-  // ---- [6] Digital Retro Flip ----
   else {
-    radarCanvas.fillScreen(radarCanvas.color565(18, 18, 20));
-    radarCanvas.fillRoundRect(42, 130, 184, 190, 16, radarCanvas.color565(34, 36, 42));
-    radarCanvas.fillRoundRect(254, 130, 184, 190, 16, radarCanvas.color565(34, 36, 42));
-    radarCanvas.drawRoundRect(42, 130, 184, 190, 16, radarCanvas.color565(90, 95, 105));
-    radarCanvas.drawRoundRect(254, 130, 184, 190, 16, radarCanvas.color565(90, 95, 105));
+    drawStepRow(112, "Brightness", String(cfg.brightness) + " %");
 
-    char hStr[4], mStr[4], sStr[16];
-    sprintf(hStr, "%02d", hr); sprintf(mStr, "%02d", mn); sprintf(sStr, "SEC %02d  ·  %s", sc, cfg.tzLabel.c_str());
+    radarCanvas.fillRoundRect(28, 178, 424, 72, 10, TFT_BLACK);
+    radarCanvas.drawRoundRect(28, 178, 424, 72, 10, colWxBorder);
+    radarCanvas.setTextDatum(middle_center); radarCanvas.setTextSize(2);
+    radarCanvas.setTextColor(colRiver);    radarCanvas.drawString("FW v" + String(FW_VERSION) + " · " + cfg.ssid, CX, 200);
+    radarCanvas.setTextColor(TFT_YELLOW);  radarCanvas.drawString("http://" + WiFi.localIP().toString(), CX, 228);
 
-    radarCanvas.setTextDatum(middle_center);
-    radarCanvas.setTextSize(8); radarCanvas.setTextColor(TFT_WHITE);
-    radarCanvas.drawString(hStr, 134, 225);
-    radarCanvas.drawString(mStr, 346, 225);
-    // 플립 중앙 분할선
-    radarCanvas.drawFastHLine(42, 225, 184, TFT_BLACK);
-    radarCanvas.drawFastHLine(254, 225, 184, TFT_BLACK);
-
-    radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_YELLOW);
-    radarCanvas.drawString(sStr, CX, 370);
+    drawToggleBtn(28,  274, 206, 54, "Wi-Fi AP Setup", false);
+    drawToggleBtn(246, 274, 206, 54, "Restart ESP32",  false);
   }
+
+  radarCanvas.fillRoundRect(34, 408, 200, 44, 10, radarCanvas.color565(18, 92, 52));
+  radarCanvas.drawRoundRect(34, 408, 200, 44, 10, greenBright);
+  radarCanvas.setTextDatum(middle_center); radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_WHITE);
+  radarCanvas.drawString("SAVE & APPLY", 134, 430);
+
+  radarCanvas.fillRoundRect(246, 408, 200, 44, 10, radarCanvas.color565(90, 24, 24));
+  radarCanvas.drawRoundRect(246, 408, 200, 44, 10, TFT_RED);
+  radarCanvas.drawString("CANCEL", 346, 430);
+}
+
+void drawViewMenuOverlay() {
+  if (!showViewMenu) return;
+  radarCanvas.fillRoundRect(60, 100, 360, 280, 16, colWxPanel);
+  radarCanvas.drawRoundRect(60, 100, 360, 280, 16, colRiver);
+  radarCanvas.setTextDatum(middle_center); radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_YELLOW);
+  radarCanvas.drawString("SELECT ACTIVE VIEW", CX, 134);
+
+  const char* labels[2] = {"FLIGHT RADAR", "WEATHER VIEW"};
+  for (int i = 0; i < 2; i++) {
+    int by = 166 + i * 74;
+    bool isCur = (cfg.viewMode == i);
+    radarCanvas.fillRoundRect(90, by, 300, 56, 12, isCur ? radarCanvas.color565(18, 72, 42) : TFT_BLACK);
+    radarCanvas.drawRoundRect(90, by, 300, 56, 12, isCur ? greenBright : colWxBorder);
+    radarCanvas.setTextColor(isCur ? greenBright : TFT_WHITE);
+    radarCanvas.drawString(labels[i], CX, by + 28);
+  }
+  radarCanvas.fillRoundRect(165, 322, 150, 40, 10, radarCanvas.color565(90, 24, 24));
+  radarCanvas.drawRoundRect(165, 322, 150, 40, 10, TFT_RED);
+  radarCanvas.setTextColor(TFT_WHITE); radarCanvas.drawString("CANCEL", CX, 342);
+}
+
+void drawRegionMenuOverlay() {
+  if (!showRegionMenu) return;
+  radarCanvas.fillRoundRect(30, 50, 420, 380, 16, colWxPanel);
+  radarCanvas.drawRoundRect(30, 50, 420, 380, 16, greenBright);
+  radarCanvas.setTextDatum(middle_center); radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_YELLOW);
+  radarCanvas.drawString("SELECT REGION", CX, 82);
+
+  for (int i = 0; i < 9; i++) {
+    int bx = 48 + (i % 3) * 132, by = 112 + (i / 3) * 84;
+    bool isCur = (cfg.presetName == TOUCH_PRESETS[i].name);
+    radarCanvas.fillRoundRect(bx, by, 120, 70, 10, isCur ? radarCanvas.color565(18, 72, 42) : TFT_BLACK);
+    radarCanvas.drawRoundRect(bx, by, 120, 70, 10, isCur ? greenBright : colWxBorder);
+    radarCanvas.setTextColor(isCur ? greenBright : TFT_WHITE);
+    radarCanvas.drawString(TOUCH_PRESETS[i].name, bx + 60, by + 35);
+  }
+  radarCanvas.fillRoundRect(165, 372, 150, 42, 10, radarCanvas.color565(90, 24, 24));
+  radarCanvas.drawRoundRect(165, 372, 150, 42, 10, TFT_RED);
+  radarCanvas.setTextColor(TFT_WHITE); radarCanvas.drawString("CANCEL", CX, 393);
+}
+
+void handleTouchInput() {
+  uint16_t tx, ty;
+  if (!lcd.getTouch(&tx, &ty)) return;
+  if (millis() - lastTouchTime < 300) return;
+  lastTouchTime = millis();
+
+  if (showSettingsMenu) {
+    if (ty >= 50 && ty <= 88) {
+      for (int i = 0; i < 3; i++) {
+        if (tx >= 26 + i * 145 && tx <= 164 + i * 145) { settingsTab = i; return; }
+      }
+    }
+    if (tx >= 34 && tx <= 234 && ty >= 408 && ty <= 452) {
+      saveConfig();
+      lcd.setBrightness(map(cfg.brightness, 10, 100, 25, 255));
+      showSettingsMenu = false;
+      startMapFetchBackground();
+      lastApiFetchTime = millis() - ((unsigned long)cfg.refreshSec * 1000UL);
+      lastWxFetchTime  = millis() - WX_FETCH_INTERVAL + 4000UL;
+      return;
+    }
+    if (tx >= 246 && tx <= 446 && ty >= 408 && ty <= 452) {
+      loadConfig();
+      lcd.setBrightness(map(cfg.brightness, 10, 100, 25, 255));
+      showSettingsMenu = false;
+      return;
+    }
+
+    if (settingsTab == 0) {
+      if (ty >= 104 && ty <= 148) {
+        if ((tx >= 205 && tx <= 253) || (tx >= 402 && tx <= 450)) cfg.mapStyle = 1 - cfg.mapStyle;
+      } else if (ty >= 162 && ty <= 206) {
+        if (tx >= 205 && tx <= 253) cfg.radiusKm = max(20.0f, cfg.radiusKm - 20.0f);
+        else if (tx >= 402 && tx <= 450) cfg.radiusKm = min(200.0f, cfg.radiusKm + 20.0f);
+      } else if (ty >= 226 && ty <= 272) {
+        if (tx >= 28 && tx <= 164) cfg.unitDist = 1 - cfg.unitDist;
+        else if (tx >= 172 && tx <= 308) cfg.unitAlt = 1 - cfg.unitAlt;
+        else if (tx >= 316 && tx <= 452) cfg.unitSpeed = 1 - cfg.unitSpeed;
+      } else if (ty >= 286 && ty <= 332) {
+        if (tx >= 28 && tx <= 234) cfg.showMapBg = !cfg.showMapBg;
+        else if (tx >= 246 && tx <= 452) cfg.showScanLine = !cfg.showScanLine;
+      } else if (ty >= 342 && ty <= 388) {
+        if (tx >= 28 && tx <= 234) cfg.showCallsign = !cfg.showCallsign;
+        else if (tx >= 246 && tx <= 452) { cfg.showAltitude = !cfg.showAltitude; cfg.showSpeed = cfg.showAltitude; }
+      }
+    } else if (settingsTab == 1) {
+      if (ty >= 112 && ty <= 168) {
+        if (tx >= 28 && tx <= 234) cfg.unitTemp = 1 - cfg.unitTemp;
+        else if (tx >= 246 && tx <= 452) cfg.unitPrecip = 1 - cfg.unitPrecip;
+      } else if (ty >= 186 && ty <= 242) cfg.wxShowCards = !cfg.wxShowCards;
+      else if (ty >= 260 && ty <= 316) cfg.wxUseRadarLoc = !cfg.wxUseRadarLoc;
+    } else {
+      if (ty >= 112 && ty <= 156) {
+        if (tx >= 205 && tx <= 253) cfg.brightness = max(10, cfg.brightness - 10);
+        else if (tx >= 402 && tx <= 450) cfg.brightness = min(100, cfg.brightness + 10);
+        lcd.setBrightness(map(cfg.brightness, 10, 100, 25, 255));
+      } else if (ty >= 274 && ty <= 328) {
+        if (tx >= 28 && tx <= 234) runApSetupPortal();
+        else if (tx >= 246 && tx <= 452) ESP.restart();
+      }
+    }
+    return;
+  }
+
+  if (showViewMenu) {
+    if (tx >= 165 && tx <= 315 && ty >= 322 && ty <= 362) { showViewMenu = false; return; }
+    for (int i = 0; i < 2; i++) {
+      int by = 166 + i * 74;
+      if (tx >= 90 && tx <= 390 && ty >= by && ty <= by + 56) {
+        int prevView = cfg.viewMode;
+        cfg.viewMode = i; saveConfig(); showViewMenu = false;
+        if (prevView != cfg.viewMode) startMapFetchBackground();
+        if (cfg.viewMode == 0) lastApiFetchTime = millis() - ((unsigned long)cfg.refreshSec * 1000UL);
+        return;
+      }
+    }
+    return;
+  }
+
+  if (showRegionMenu) {
+    if (tx >= 165 && tx <= 315 && ty >= 372 && ty <= 414) { showRegionMenu = false; return; }
+    for (int i = 0; i < 9; i++) {
+      int bx = 48 + (i % 3) * 132, by = 112 + (i / 3) * 84;
+      if (tx >= bx && tx <= bx + 120 && ty >= by && ty <= by + 70) {
+        cfg.presetName = TOUCH_PRESETS[i].name;
+        cfg.lat = TOUCH_PRESETS[i].lat; cfg.lon = TOUCH_PRESETS[i].lon;
+        cfg.tzPosix = TOUCH_PRESETS[i].tzPosix; cfg.tzLabel = TOUCH_PRESETS[i].tzLabel;
+        if (cfg.wxUseRadarLoc) { cfg.wxLat = cfg.lat; cfg.wxLon = cfg.lon; }
+        saveConfig();
+        configTzTime(cfg.tzPosix.c_str(), "pool.ntp.org", "time.nist.gov");
+        showRegionMenu = false;
+        startMapFetchBackground();
+        lastApiFetchTime = millis() - ((unsigned long)cfg.refreshSec * 1000UL);
+        lastWxFetchTime  = millis() - WX_FETCH_INTERVAL + 4000UL;
+        return;
+      }
+    }
+    return;
+  }
+
+  bool hitViewBtn = (cfg.viewMode == 1) ? (tx >= 5 && tx <= 95 && ty >= 5 && ty <= 55)
+                                        : (tx >= 140 && tx <= 240 && ty >= 0 && ty <= 48);
+  if (hitViewBtn) { showViewMenu = true; return; }
+
+  bool hitSetBtn = (cfg.viewMode == 1) ? (tx >= 385 && tx <= 475 && ty >= 5 && ty <= 55)
+                                       : (tx >= 242 && tx <= 340 && ty >= 0 && ty <= 48);
+  if (hitSetBtn) {
+    settingsTab = cfg.viewMode;
+    showSettingsMenu = true;
+    return;
+  }
+
+  bool hitRegionBtn = (cfg.viewMode == 0 && tx >= 330 && ty >= 415) ||
+                      (cfg.viewMode == 1 && ty >= 425);
+  if (hitRegionBtn) { showRegionMenu = true; return; }
 }
 
 // ==========================================
-// 10. 레이더 & 날씨 화면 렌더링
+// 11. 레이더 & 날씨 화면 렌더링
 // ==========================================
 void drawMapBackground() {
   if (mapLoaded) mapBgSprite.pushSprite(&radarCanvas, 0, 0);
@@ -1913,11 +1914,9 @@ void drawFullWeatherView() {
   radarCanvas.fillCircle(CX, CY, 4, TFT_WHITE);
 
   radarCanvas.setTextDatum(middle_center);
-  radarCanvas.setTextSize(2);
-  radarCanvas.setTextColor(TFT_WHITE, colWxPanel);
-  struct tm ti;
-  char tStr[10] = "--:--";
-  if (getLocalTime(&ti)) sprintf(tStr, "%02d:%02d", ti.tm_hour, ti.tm_min);
+  radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_WHITE, colWxPanel);
+  struct tm ti; char tStr[10] = "--:--";
+  if (getLocalTime(&ti, 0)) sprintf(tStr, "%02d:%02d", ti.tm_hour, ti.tm_min);
   radarCanvas.drawString(" WEATHER   " + String(tStr) + " ", CX, 32);
 
   radarCanvas.fillRoundRect(92, 54, 96, 26, 13, radarCanvas.color565(18, 72, 42));
@@ -1974,12 +1973,10 @@ void drawFullWeatherView() {
 
   const char* dayLabels[3] = {"Today", "Tmrw", "Day 3"};
   int colCenters[3] = {117, 240, 363};
-
   for (int i = 0; i < 3; i++) {
     int cx = colCenters[i];
     float dMax = (cfg.unitTemp == 1) ? (wxData.dayMaxC[i] * 9.0f / 5.0f + 32.0f) : wxData.dayMaxC[i];
     float dMin = (cfg.unitTemp == 1) ? (wxData.dayMinC[i] * 9.0f / 5.0f + 32.0f) : wxData.dayMinC[i];
-
     radarCanvas.setTextDatum(middle_center);
     radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_LIGHTGREY); radarCanvas.drawString(dayLabels[i], cx, 328);
     drawWeatherIcon(cx - 32, 358, wxData.dayCode[i], 0.72f);
@@ -2056,8 +2053,14 @@ void drawWeatherOverlayCard() {
 }
 
 void drawRadarFrameToCanvas() {
-  if (cfg.viewMode == 1) { drawFullWeatherView(); return; }
-  if (cfg.viewMode == 2) { drawClockView(); return; }
+  if (cfg.viewMode == 1) {
+    drawFullWeatherView();
+    drawTopActionButtons();
+    drawRegionMenuOverlay();
+    drawViewMenuOverlay();
+    drawSettingsMenuOverlay();
+    return;
+  }
 
   if (!cfg.showMapBg) radarCanvas.fillRect(2, 2, SCREEN_W - 4, SCREEN_H - 4, TFT_BLACK);
   else drawMapBackground();
@@ -2146,37 +2149,44 @@ void drawRadarFrameToCanvas() {
   radarCanvas.drawRect(SCREEN_W - 110, 6, 104, 34, greenBright);
   radarCanvas.setTextDatum(top_right);
   struct tm ti; radarCanvas.setTextSize(2); radarCanvas.setTextColor(TFT_YELLOW);
-  if (getLocalTime(&ti)) { char tStr[12]; sprintf(tStr, "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec); radarCanvas.drawString(tStr, SCREEN_W - 10, 8); }
+  if (getLocalTime(&ti, 0)) { char tStr[12]; sprintf(tStr, "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec); radarCanvas.drawString(tStr, SCREEN_W - 10, 8); }
   else radarCanvas.drawString("--:--:--", SCREEN_W - 10, 8);
   radarCanvas.setTextSize(1); radarCanvas.setTextColor(green); radarCanvas.drawString(cfg.tzLabel, SCREEN_W - 10, 28);
 
   drawWeatherOverlayCard();
 
-  radarCanvas.fillRect(SCREEN_W - 126, SCREEN_H - 42, 120, 36, TFT_BLACK);
-  radarCanvas.drawRect(SCREEN_W - 126, SCREEN_H - 42, 120, 36, greenBright);
+  // 우측 하단: 공항명 + 로컬 접속 주소 + IP 주소
+  radarCanvas.fillRect(SCREEN_W - 130, SCREEN_H - 52, 124, 46, TFT_BLACK);
+  radarCanvas.drawRect(SCREEN_W - 130, SCREEN_H - 52, 124, 46, greenBright);
   radarCanvas.setTextDatum(bottom_right);
-  radarCanvas.setTextSize(2); radarCanvas.setTextColor(greenBright); radarCanvas.drawString(cfg.presetName, SCREEN_W - 10, SCREEN_H - 22);
-  radarCanvas.setTextSize(1); radarCanvas.setTextColor(TFT_YELLOW);  radarCanvas.drawString(cfg.hostname + ".local", SCREEN_W - 10, SCREEN_H - 8);
+  radarCanvas.setTextSize(2); radarCanvas.setTextColor(greenBright); radarCanvas.drawString(cfg.presetName, SCREEN_W - 10, SCREEN_H - 32);
+  radarCanvas.setTextSize(1); radarCanvas.setTextColor(TFT_YELLOW);  radarCanvas.drawString(cfg.hostname + ".local", SCREEN_W - 10, SCREEN_H - 18);
+  radarCanvas.setTextColor(colRiver);                                radarCanvas.drawString(WiFi.localIP().toString(), SCREEN_W - 10, SCREEN_H - 7);
 
   radarCanvas.drawRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, greenBright);
+  drawTopActionButtons();
+  drawRegionMenuOverlay();
+  drawViewMenuOverlay();
+  drawSettingsMenuOverlay();
 }
 
 // ---------- SETUP ----------
 void setup() {
   Serial.begin(115200);
   delay(400);
+  Serial.printf("\n=== RADAR 360 Boot (v%s) ===\n", FW_VERSION);
 
   loadConfig();
   st7701_init_panel();
 
   lcd.init();
-  lcd.setBrightness(map(cfg.brightness, 10, 100, 25, 255));
+  lcd.setBrightness(60); // 부팅 및 Wi-Fi 연결 중 백라이트 전력 최소화
 
   greenBright = lcd.color565(0, 255, 60);
   green       = lcd.color565(0, 200, 50);
   greenDim    = lcd.color565(20, 120, 55);
   greenDark   = lcd.color565(15, 60, 40);
-  colSeaBg    = lcd.color565(12, 32, 54);
+  colSeaBg    = lcd.color565(8, 20, 34);
   colRiver    = lcd.color565(60, 190, 255);
   colAirport  = lcd.color565(255, 210, 0);
   colCardBg   = lcd.color565(10, 22, 26);
@@ -2184,10 +2194,10 @@ void setup() {
   colWxBorder = lcd.color565(58, 92, 116);
 
   radarCanvas.setPsram(true); radarCanvas.setColorDepth(16); radarCanvas.setSwapBytes(false);
-  radarCanvas.createSprite(480, 480);
+  if (!radarCanvas.createSprite(480, 480)) Serial.println("[ERR] radarCanvas PSRAM alloc failed!");
 
   mapBgSprite.setPsram(true); mapBgSprite.setColorDepth(16); mapBgSprite.setSwapBytes(false);
-  mapBgSprite.createSprite(480, 480);
+  if (!mapBgSprite.createSprite(480, 480)) Serial.println("[ERR] mapBgSprite PSRAM alloc failed!");
   mapBgSprite.fillScreen(colSeaBg);
 
   if (cfg.ssid.length() == 0) runApSetupPortal();
@@ -2198,6 +2208,7 @@ void setup() {
   lcd.setTextColor(greenBright, TFT_BLACK); lcd.drawString(cfg.ssid, 240, 255);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); // 전압 강하 방지
   WiFi.setSleep(false);
   WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
 
@@ -2206,21 +2217,18 @@ void setup() {
 
   if (WiFi.status() != WL_CONNECTED) runApSetupPortal();
 
+  Serial.print("WiFi Connected! IP: ");
+  Serial.println(WiFi.localIP());
+
+  lcd.setBrightness(map(cfg.brightness, 10, 100, 25, 255));
+
   MDNS.begin(cfg.hostname.c_str());
   setupWebServer();
   configTzTime(cfg.tzPosix.c_str(), "pool.ntp.org", "time.nist.gov");
 
-  if (cfg.viewMode != 2) {
-    lcd.drawString("Downloading Google Map...", 240, 295);
-    fetchMapTiles();
-  }
-
-  fetchAircraftData();
-  applyPendingAircraftData();
-  fetchWeatherData();
-  applyPendingWeatherData();
-  lastApiFetchTime = millis();
-  lastWxFetchTime = millis();
+  startMapFetchBackground();
+  lastApiFetchTime = millis() - ((unsigned long)cfg.refreshSec * 1000UL);
+  lastWxFetchTime  = millis() - WX_FETCH_INTERVAL + 5000UL;
 
   drawRadarFrameToCanvas();
   radarCanvas.pushSprite(0, 0);
@@ -2230,30 +2238,35 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  unsigned long interval = (cfg.viewMode == 0) ? SWEEP_SPEED : 250;
+  if (otaTriggerFlag) {
+    otaTriggerFlag = false;
+    performGitHubOTA();
+  }
+
+  handleTouchInput();
+
+  unsigned long interval = (cfg.viewMode == 0 && !showSettingsMenu) ? SWEEP_SPEED : 150;
   if (millis() - lastSweepUpdate > interval) {
     lastSweepUpdate = millis();
 
     applyPendingWeatherData();
+    applyPendingAircraftData();
     drawRadarFrameToCanvas();
     radarCanvas.pushSprite(0, 0);
 
-    if (cfg.viewMode == 0) {
+    if (cfg.viewMode == 0 && !showSettingsMenu) {
       sweepAngle += 2;
-      if (sweepAngle >= 360) {
-        sweepAngle -= 360;
-        applyPendingAircraftData();
-
-        if (millis() - lastApiFetchTime > (unsigned long)cfg.refreshSec * 1000UL) {
-          lastApiFetchTime = millis();
-          startAircraftFetchBackground();
-        }
-      }
+      if (sweepAngle >= 360) sweepAngle -= 360;
     }
 
-    if (millis() - lastWxFetchTime > WX_FETCH_INTERVAL) {
-      lastWxFetchTime = millis();
-      startWeatherFetchBackground();
+    if (!isAnyHttpsBusy()) {
+      if (cfg.viewMode == 0 && millis() - lastApiFetchTime > (unsigned long)cfg.refreshSec * 1000UL) {
+        lastApiFetchTime = millis();
+        startAircraftFetchBackground();
+      } else if (millis() - lastWxFetchTime > WX_FETCH_INTERVAL) {
+        lastWxFetchTime = millis();
+        startWeatherFetchBackground();
+      }
     }
   }
 }
